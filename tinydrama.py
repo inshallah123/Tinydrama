@@ -20,10 +20,7 @@ from typing import Optional, Any
 class WebSocketClient:
     """简易WebSocket客户端实现"""
 
-    GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
     def __init__(self, url: str):
-        self.url = url
         parsed = urlparse(url)
         self.host = parsed.hostname
         self.port = parsed.port or 80
