@@ -170,7 +170,9 @@ class CDPSession:
                     self._responses[msg["id"]] = msg
                 else:
                     self._handle_event(msg)
-        except socket.timeout:
+        except (socket.timeout, BlockingIOError):
+            # socket.timeout: 阻塞模式下超时
+            # BlockingIOError: 非阻塞模式下无数据可读 (timeout=0)
             pass
         finally:
             self.ws.sock.settimeout(self.ws.timeout)
@@ -246,6 +248,9 @@ class Tab:
 
     def _evaluate(self, expression: str, return_by_value: bool = True) -> Any:
         """执行JavaScript表达式（在当前 frame 中）"""
+        # 先处理待接收事件，确保 context 映射是最新的
+        self.cdp.poll_events(timeout=0)
+
         params = {
             "expression": expression,
             "returnByValue": return_by_value,
@@ -257,9 +262,13 @@ class Tab:
         try:
             result = self.cdp.send("Runtime.evaluate", params)
         except Exception as e:
-            # context 失效时（页面导航中），退回到默认 context 重试
-            if "Cannot find context" in str(e) and "contextId" in params:
-                del params["contextId"]
+            # context 失效时（页面导航中），等待新 context 事件到达后重试
+            if "Cannot find context" in str(e):
+                self.cdp.poll_events(timeout=0.5)
+                if self._current_frame_id and self._current_frame_id in self.cdp._frame_contexts:
+                    params["contextId"] = self.cdp._frame_contexts[self._current_frame_id]
+                else:
+                    params.pop("contextId", None)
                 result = self.cdp.send("Runtime.evaluate", params)
             else:
                 raise
@@ -319,9 +328,19 @@ class Tab:
 
     # ==================== 元素操作 ====================
 
+    def _scroll_into_view(self, selector: str):
+        """滚动元素到视口内"""
+        result = self._evaluate(f"document.querySelector({json.dumps(selector)})", return_by_value=False)
+        object_id = result.get("objectId")
+        if object_id:
+            self.cdp.send("DOM.scrollIntoViewIfNeeded", {"objectId": object_id})
+
     def click(self, selector: str):
         """点击元素"""
-        elem = self.wait_for_selector(selector)
+        self.wait_for_selector(selector)
+        self._scroll_into_view(selector)
+        elem = self.query_selector(selector)
+        assert elem is not None
         x, y = elem["x"], elem["y"]
 
         self.cdp.send("Input.dispatchMouseEvent", {
@@ -407,7 +426,7 @@ class Tab:
         for child in node.get("childFrames", []):
             self._collect_frames(child, frames, depth + 1)
 
-    def switch_to_frame(self, selector: Optional[str] = None, name: Optional[str] = None, index: Optional[int] = None):
+    def switch_to_frame(self, selector: Optional[str] = None, name: Optional[str] = None, index: Optional[int] = None, timeout: float = 5.0):
         """切换到iframe"""
         self._update_frame_tree()
 
@@ -423,26 +442,34 @@ class Tab:
                 raise Exception(f"元素不是iframe: {selector}")
 
             self._current_frame_id = frame_id
-            return
 
-        frames = []
-        self._collect_frames(self._frame_tree, frames)
-
-        if name is not None:
+        elif name is not None:
+            frames = []
+            self._collect_frames(self._frame_tree, frames)
             for frame in frames:
                 if frame["name"] == name:
                     self._current_frame_id = frame["id"]
-                    return
-            raise Exception(f"未找到name为'{name}'的iframe")
+                    break
+            else:
+                raise Exception(f"未找到name为'{name}'的iframe")
 
-        if index is not None:
+        elif index is not None:
+            frames = []
+            self._collect_frames(self._frame_tree, frames)
             child_frames = [f for f in frames if f["depth"] > 0]
             if index >= len(child_frames):
                 raise Exception(f"iframe索引越界: {index}")
             self._current_frame_id = child_frames[index]["id"]
-            return
 
-        raise Exception("必须指定selector、name或index之一")
+        else:
+            raise Exception("必须指定selector、name或index之一")
+
+        # 等待 iframe 的 context 就绪
+        for _ in range(int(timeout * 10)):
+            self.cdp.poll_events(timeout=0.1)
+            if self._current_frame_id in self.cdp._frame_contexts:
+                return
+        raise Exception(f"iframe context 未就绪: {self._current_frame_id}")
 
     def switch_to_main_frame(self):
         """切换回主frame"""
@@ -567,10 +594,180 @@ class Tab:
         """激活此标签页（使其可见）"""
         self.cdp.send("Target.activateTarget", {"targetId": self.target_id})
 
-    def close(self):
-        """关闭此标签页"""
-        self.cdp.send("Target.closeTarget", {"targetId": self.target_id})
-        self.cdp.close()
+    # ==================== 便捷方法 ====================
+
+    def click_by_text(self, text: str, tag: str = "*", exact: bool = False, timeout: float = 10):
+        """通过文本内容点击元素"""
+        if exact:
+            condition = f"el.textContent?.trim() === {json.dumps(text)}"
+        else:
+            condition = f"el.textContent?.includes({json.dumps(text)})"
+
+        js = f"""
+        (function() {{
+            for (const el of document.querySelectorAll('{tag}')) {{
+                if ({condition} && el.offsetParent !== null) {{
+                    el.setAttribute('data-td-tmp', '1');
+                    return true;
+                }}
+            }}
+            return false;
+        }})()
+        """
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._evaluate(js):
+                self.click("[data-td-tmp='1']")
+                self._evaluate("document.querySelector('[data-td-tmp]')?.removeAttribute('data-td-tmp')")
+                return
+            time.sleep(0.1)
+        raise Exception(f"未找到文本: {text}")
+
+    def query_all(self, selector: str) -> list[dict]:
+        """查询所有匹配的元素"""
+        js = f"""
+        Array.from(document.querySelectorAll({json.dumps(selector)})).map((el, i) => {{
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return {{
+                index: i,
+                tag: el.tagName.toLowerCase(),
+                id: el.id || null,
+                text: el.textContent?.trim().substring(0, 50) || '',
+                visible: style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null,
+                x: rect.x + rect.width / 2,
+                y: rect.y + rect.height / 2
+            }};
+        }})
+        """
+        return self._evaluate(js) or []
+
+    def click_all(self, selector: str, delay: float = 0.3) -> int:
+        """点击所有匹配的元素，返回点击数量"""
+        elements = self.query_all(selector)
+        visible = [el for el in elements if el.get("visible")]
+        count = 0
+        for el in visible:
+            try:
+                self._scroll_into_view(selector)
+                # 重新获取坐标（滚动后可能变化）
+                fresh = self.query_all(selector)
+                if count < len(fresh) and fresh[count].get("visible"):
+                    x, y = fresh[count]["x"], fresh[count]["y"]
+                    self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+                    self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+                    count += 1
+                    time.sleep(delay)
+            except Exception:
+                break
+        return count
+
+    def find_by_text(self, text: str, tag: str = "*", exact: bool = False) -> Optional[dict]:
+        """通过文本查找元素，返回元素信息"""
+        if exact:
+            condition = f"el.textContent?.trim() === {json.dumps(text)}"
+        else:
+            condition = f"el.textContent?.includes({json.dumps(text)})"
+
+        js = f"""
+        (function() {{
+            for (const el of document.querySelectorAll('{tag}')) {{
+                if ({condition}) {{
+                    const rect = el.getBoundingClientRect();
+                    return {{
+                        tag: el.tagName.toLowerCase(),
+                        id: el.id || null,
+                        class: el.className || null,
+                        text: el.textContent?.trim().substring(0, 100),
+                        x: rect.x + rect.width / 2,
+                        y: rect.y + rect.height / 2
+                    }};
+                }}
+            }}
+            return null;
+        }})()
+        """
+        return self._evaluate(js)
+
+    def count(self, selector: str) -> int:
+        """统计匹配元素数量"""
+        return self._evaluate(f"document.querySelectorAll({json.dumps(selector)}).length") or 0
+
+    def hover(self, selector: str):
+        """悬停在元素上"""
+        self.wait_for_selector(selector)
+        self._scroll_into_view(selector)
+        elem = self.query_selector(selector)
+        assert elem is not None
+        self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": elem["x"], "y": elem["y"]})
+
+    def double_click(self, selector: str):
+        """双击元素"""
+        self.wait_for_selector(selector)
+        self._scroll_into_view(selector)
+        elem = self.query_selector(selector)
+        assert elem is not None
+        x, y = elem["x"], elem["y"]
+        self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})
+        self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})
+
+    def select_by_text(self, selector: str, text: str):
+        """通过选项文本选择下拉框"""
+        self.wait_for_selector(selector)
+        js = f"""
+        (function() {{
+            const sel = document.querySelector({json.dumps(selector)});
+            if (!sel) return false;
+            for (const opt of sel.options) {{
+                if (opt.text?.includes({json.dumps(text)})) {{
+                    sel.value = opt.value;
+                    sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return true;
+                }}
+            }}
+            return false;
+        }})()
+        """
+        if not self._evaluate(js):
+            raise Exception(f"未找到选项: {text}")
+
+    def click_js(self, selector: str):
+        """通过 JS click() 点击元素（更可靠，适合小图标等）"""
+        self.wait_for_selector(selector)
+        clicked = self._evaluate(f"""
+        (function() {{
+            const el = document.querySelector({json.dumps(selector)});
+            if (el) {{ el.click(); return true; }}
+            return false;
+        }})()
+        """)
+        if not clicked:
+            raise Exception(f"点击失败: {selector}")
+
+    def get_options(self, selector: str) -> list[dict]:
+        """获取下拉框的所有选项"""
+        js = f"""
+        (function() {{
+            const sel = document.querySelector({json.dumps(selector)});
+            if (!sel) return [];
+            return Array.from(sel.options).map(o => ({{
+                value: o.value,
+                text: o.text,
+                selected: o.selected
+            }}));
+        }})()
+        """
+        return self._evaluate(js) or []
+
+    def get_selected_text(self, selector: str) -> str:
+        """获取下拉框当前选中的文本"""
+        js = f"document.querySelector({json.dumps(selector)})?.selectedOptions[0]?.text || ''"
+        return self._evaluate(js)
+
+    def is_checked(self, selector: str) -> bool:
+        """检查复选框是否选中"""
+        js = f"document.querySelector({json.dumps(selector)})?.checked || false"
+        return self._evaluate(js)
 
 
 class MiniBrowser:
@@ -721,7 +918,8 @@ class MiniBrowser:
 
     def close_tab(self, tab: 'Tab'):
         """关闭指定标签页"""
-        tab.close()
+        tab.cdp.send("Target.closeTarget", {"targetId": tab.target_id})
+        tab.cdp.close()
         self._tabs.pop(tab.target_id, None)
 
     def close(self):
