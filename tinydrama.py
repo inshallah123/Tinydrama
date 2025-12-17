@@ -49,7 +49,7 @@ class WebSocketClient:
         while b"\r\n\r\n" not in response:
             response += self.sock.recv(1024)
 
-        if b"101" not in response:
+        if not response.startswith(b"HTTP/1.1 101"):
             raise Exception(f"WebSocket握手失败: {response.decode()}")
 
     def send(self, data: str):
@@ -116,22 +116,23 @@ class WebSocketClient:
     def close(self):
         self.sock.close()
 
+
 class CDPSession:
-    """Chrome DevTools Protocol 会话"""
+    """Chrome DevTools Protocol 会话 - 纯通信层"""
 
     def __init__(self, ws_url: str, timeout: float = 30):
         self.ws = WebSocketClient(ws_url, timeout)
         self.ws.connect()
         self._msg_id = 0
         self._responses = {}
-        # 实时处理的事件存储
+        # CDP 事件状态
         self._frame_contexts: dict[str, int] = {}  # frame_id -> context_id
-        self._pending_downloads: dict[str, dict] = {}  # guid -> download info
-        self._completed_downloads: dict[str, dict] = {}  # guid -> completion info
+        self._pending_downloads: dict[str, dict] = {}
+        self._completed_downloads: dict[str, dict] = {}
         self._pending_dialog: Optional[dict] = None
 
     def send(self, method: str, params: Optional[dict] = None) -> dict:
-        """发送CDP命令并等待响应，仅 method → 无参数命令，method + params → 带参数命令"""
+        """发送CDP命令并等待响应"""
         self._msg_id += 1
         msg_id = self._msg_id
 
@@ -139,7 +140,7 @@ class CDPSession:
         if params:
             message["params"] = params
         self.ws.send(json.dumps(message))
-        # 等待响应
+
         while msg_id not in self._responses:
             try:
                 data = self.ws.recv()
@@ -148,7 +149,6 @@ class CDPSession:
                 if "id" in msg:
                     self._responses[msg["id"]] = msg
                 else:
-                    # 实时处理事件
                     self._handle_event(msg)
             except socket.timeout:
                 raise Exception(f"等待响应超时: {method}")
@@ -171,12 +171,12 @@ class CDPSession:
                 else:
                     self._handle_event(msg)
         except socket.timeout:
-            pass  # 没有更多消息
+            pass
         finally:
             self.ws.sock.settimeout(self.ws.timeout)
 
     def _handle_event(self, event: dict):
-        """实时处理 CDP 事件"""
+        """处理 CDP 事件"""
         method = event.get("method")
         params = event.get("params", {})
 
@@ -189,7 +189,6 @@ class CDPSession:
                 self._frame_contexts[frame_id] = ctx["id"]
 
         elif method == "Runtime.executionContextDestroyed":
-            # 清理已销毁的 context
             ctx_id = params.get("executionContextId")
             self._frame_contexts = {k: v for k, v in self._frame_contexts.items() if v != ctx_id}
 
@@ -212,148 +211,14 @@ class CDPSession:
         self.ws.close()
 
 
-class MiniBrowser:
-    """简易浏览器自动化类"""
+class Tab:
+    """单个标签页 - 包含所有页面操作方法"""
 
-    # ==================== 初始化与生命周期 ====================
-
-    def __init__(self, debug_port: int = 9222, timeout: float = 30):
-        self.debug_port = debug_port
-        self.timeout = timeout
-        self.process: Optional[subprocess.Popen] = None
-        self._sessions: dict[str, CDPSession] = {}  # target_id -> CDPSession
-        self._current_target_id: Optional[str] = None
+    def __init__(self, cdp: CDPSession, target_id: str):
+        self.cdp = cdp
+        self.target_id = target_id
         self._frame_tree: dict = {}
         self._current_frame_id: Optional[str] = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
-
-    @property
-    def cdp(self) -> CDPSession:
-        """获取当前标签页的CDP会话"""
-        assert self._current_target_id is not None, "未连接浏览器"
-        return self._sessions[self._current_target_id]
-
-    def launch(self, kill_existing: bool = True, browser: str = "auto"):
-        """启动浏览器并连接（使用默认profile，支持安全控件）
-
-        Args:
-            kill_existing: 是否先杀掉已有浏览器进程（默认True）
-            browser: 浏览器选择 - "auto"（自动检测）| "chrome" | "edge" | 完整路径
-        """
-        # 确定浏览器路径和进程名
-        if browser == "auto":
-            browser_path = self._find_browser()
-        elif browser == "chrome":
-            browser_path = self._find_browser("chrome")
-        elif browser == "edge":
-            browser_path = self._find_browser("edge")
-        else:
-            browser_path = browser  # 用户传入完整路径
-
-        # 根据路径判断进程名
-        process_name = "msedge.exe" if "edge" in browser_path.lower() else "chrome.exe"
-
-        if kill_existing:
-            os.system(f"taskkill /f /im {process_name} 2>nul")
-            # 轮询直到进程消失
-            for _ in range(10):
-                result = subprocess.run("tasklist", capture_output=True, text=True, shell=True)
-                if process_name not in result.stdout:
-                    break
-                time.sleep(0.1)
-
-        args = [
-            browser_path,
-            f"--remote-debugging-port={self.debug_port}",
-        ]
-        self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        # 轮询直到能连接
-        last_error = None
-        for _ in range(20):
-            try:
-                self._connect()
-                return
-            except Exception as e:
-                last_error = e
-                time.sleep(0.1)
-        raise Exception(f"浏览器启动超时: {last_error}")
-
-    def _find_browser(self, browser_type: str = "auto") -> str:
-        """查找浏览器路径
-
-        Args:
-            browser_type: "auto" | "chrome" | "edge"
-        """
-        chrome_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ]
-        edge_paths = [
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ]
-
-        if browser_type == "chrome":
-            paths = chrome_paths
-        elif browser_type == "edge":
-            paths = edge_paths
-        else:  # auto: 优先 Chrome
-            paths = chrome_paths + edge_paths
-
-        for p in paths:
-            if os.path.exists(p):
-                return p
-        raise Exception(f"未找到浏览器: {browser_type}")
-
-    def connect(self):
-        """连接到已运行的浏览器"""
-        self._connect()
-
-    def _get_targets(self) -> list:
-        """获取所有调试目标"""
-        conn = http.client.HTTPConnection("127.0.0.1", self.debug_port)
-        conn.request("GET", "/json")
-        response = conn.getresponse()
-        targets = json.loads(response.read().decode())
-        conn.close()
-        return targets
-
-    def _connect(self, target_id: Optional[str] = None):
-        """内部连接方法"""
-        targets = self._get_targets()
-
-        # 找到目标页面
-        page_target = None
-        for target in targets:
-            if target.get("type") == "page":
-                if target_id is None or target.get("id") == target_id:
-                    page_target = target
-                    break
-
-        if not page_target:
-            raise Exception("未找到可用的页面")
-
-        tid = page_target["id"]
-        ws_url = page_target["webSocketDebuggerUrl"]
-        session = CDPSession(ws_url, self.timeout)
-
-        # 存储到字典并设置为当前
-        self._sessions[tid] = session
-        self._current_target_id = tid
-
-        # 启用必要的域
-        self.cdp.send("Page.enable")
-        self.cdp.send("Runtime.enable")
-        self.cdp.send("DOM.enable")
-
-        # 获取frame树（执行上下文由 CDPSession 实时维护）
-        self._update_frame_tree()
 
     # ==================== 页面导航 ====================
 
@@ -364,7 +229,7 @@ class MiniBrowser:
         self._update_frame_tree()
 
     def _update_frame_tree(self):
-        """更新frame树"""
+        """更新 frame 树"""
         result = self.cdp.send("Page.getFrameTree")
         self._frame_tree = result.get("frameTree", {})
         self._current_frame_id = self._frame_tree.get("frame", {}).get("id")
@@ -386,11 +251,18 @@ class MiniBrowser:
             "returnByValue": return_by_value,
         }
 
-        # 如果有当前 frame 的 context，使用它（从 CDPSession 实时维护的数据中获取）
         if self._current_frame_id and self._current_frame_id in self.cdp._frame_contexts:
             params["contextId"] = self.cdp._frame_contexts[self._current_frame_id]
 
-        result = self.cdp.send("Runtime.evaluate", params)
+        try:
+            result = self.cdp.send("Runtime.evaluate", params)
+        except Exception as e:
+            # context 失效时（页面导航中），退回到默认 context 重试
+            if "Cannot find context" in str(e) and "contextId" in params:
+                del params["contextId"]
+                result = self.cdp.send("Runtime.evaluate", params)
+            else:
+                raise
 
         if "exceptionDetails" in result:
             raise Exception(f"JS执行错误: {result['exceptionDetails']}")
@@ -416,7 +288,6 @@ class MiniBrowser:
             if (!el) return null;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
-            // 使用 computedStyle 判断可见性，因为 getBoundingClientRect 在某些情况下返回 0
             const computedWidth = parseFloat(style.width) || 0;
             const computedHeight = parseFloat(style.height) || 0;
             const isVisible = style.display !== 'none' &&
@@ -453,7 +324,6 @@ class MiniBrowser:
         elem = self.wait_for_selector(selector)
         x, y = elem["x"], elem["y"]
 
-        # 模拟鼠标点击
         self.cdp.send("Input.dispatchMouseEvent", {
             "type": "mousePressed",
             "x": x, "y": y,
@@ -467,29 +337,8 @@ class MiniBrowser:
             "clickCount": 1
         })
 
-    def type_text(self, selector: str, text: str, clear: bool = True):
-        """在输入框中输入文本"""
-        self.click(selector)
-        time.sleep(0.1)
-
-        if clear:
-            # 清空现有内容
-            js = f"document.querySelector({json.dumps(selector)}).value = ''"
-            self._evaluate(js)
-
-        # 逐字符输入
-        for char in text:
-            self.cdp.send("Input.dispatchKeyEvent", {
-                "type": "keyDown",
-                "text": char,
-            })
-            self.cdp.send("Input.dispatchKeyEvent", {
-                "type": "keyUp",
-                "text": char,
-            })
-
     def fill(self, selector: str, value: str):
-        """直接填充表单值（更快）"""
+        """填充表单值"""
         self.wait_for_selector(selector)
         js = f"""
         (function(selector, value) {{
@@ -546,12 +395,6 @@ class MiniBrowser:
 
     # ==================== iframe 支持 ====================
 
-    def get_frames(self) -> list:
-        """获取所有iframe列表"""
-        frames = []
-        self._collect_frames(self._frame_tree, frames)
-        return frames
-
     def _collect_frames(self, node: dict, frames: list, depth: int = 0):
         """递归收集frame信息"""
         frame = node.get("frame", {})
@@ -565,17 +408,10 @@ class MiniBrowser:
             self._collect_frames(child, frames, depth + 1)
 
     def switch_to_frame(self, selector: Optional[str] = None, name: Optional[str] = None, index: Optional[int] = None):
-        """切换到iframe
-
-        Args:
-            selector: iframe的CSS选择器
-            name: iframe的name属性
-            index: iframe的索引（从0开始）
-        """
+        """切换到iframe"""
         self._update_frame_tree()
 
         if selector:
-            # 通过 CDP 直接获取 iframe 元素对应的 frameId
             result = self._evaluate(f"document.querySelector({json.dumps(selector)})", return_by_value=False)
             object_id = result.get("objectId")
             if not object_id:
@@ -589,7 +425,8 @@ class MiniBrowser:
             self._current_frame_id = frame_id
             return
 
-        frames = self.get_frames()
+        frames = []
+        self._collect_frames(self._frame_tree, frames)
 
         if name is not None:
             for frame in frames:
@@ -599,7 +436,6 @@ class MiniBrowser:
             raise Exception(f"未找到name为'{name}'的iframe")
 
         if index is not None:
-            # 获取子frame（排除主frame）
             child_frames = [f for f in frames if f["depth"] > 0]
             if index >= len(child_frames):
                 raise Exception(f"iframe索引越界: {index}")
@@ -613,7 +449,7 @@ class MiniBrowser:
         self._update_frame_tree()
         self._current_frame_id = self._frame_tree.get("frame", {}).get("id")
 
-    # ==================== 其他实用方法 ====================
+    # ==================== 其他操作 ====================
 
     def screenshot(self, path: Optional[str] = None) -> bytes:
         """截图"""
@@ -628,20 +464,8 @@ class MiniBrowser:
         """执行自定义JavaScript"""
         return self._evaluate(script)
 
-    def wait(self, seconds: float):
-        """等待指定秒数"""
-        time.sleep(seconds)
-
-    def submit_form(self, selector: str):
-        """提交表单"""
-        js = f"document.querySelector({json.dumps(selector)})?.submit()"
-        self._evaluate(js)
-
     def enable_download(self, download_path: str):
-        """启用下载并指定保存目录
-
-        注意：下载路径是浏览器全局设置，多标签页共享同一路径
-        """
+        """启用下载并指定保存目录（浏览器全局设置）"""
         self.cdp.send("Browser.setDownloadBehavior", {
             "behavior": "allow",
             "downloadPath": download_path,
@@ -649,14 +473,13 @@ class MiniBrowser:
         })
 
     def wait_for_download(self, timeout: float = 60) -> dict:
-        """等待当前标签页的下载完成，返回下载信息"""
+        """等待下载完成"""
         my_frame_id = self._current_frame_id
         if not my_frame_id:
             raise Exception("未初始化frame，请先导航到页面")
         guid = None
         start = time.time()
 
-        # 1. 找属于当前 frame 的下载，获取 guid
         while time.time() - start < timeout:
             self.cdp.poll_events()
             for g, info in list(self.cdp._pending_downloads.items()):
@@ -671,7 +494,6 @@ class MiniBrowser:
         if not guid:
             raise Exception("未检测到下载开始")
 
-        # 2. 等待该 guid 的下载完成
         while time.time() - start < timeout:
             self.cdp.poll_events()
             if guid in self.cdp._completed_downloads:
@@ -682,77 +504,21 @@ class MiniBrowser:
         raise Exception("下载超时")
 
     def upload_file(self, selector: str, file_path: str):
-        """上传文件（支持 iframe）"""
+        """上传文件"""
         self.wait_for_selector(selector)
 
-        # 在当前 frame 中获取元素的 objectId
         result = self._evaluate(f"document.querySelector({json.dumps(selector)})", return_by_value=False)
         object_id = result.get("objectId")
         if not object_id:
             raise Exception(f"未找到文件输入元素: {selector}")
 
-        # 将 objectId 转换为 backendNodeId
         node_info = self.cdp.send("DOM.describeNode", {"objectId": object_id})
         backend_node_id = node_info["node"]["backendNodeId"]
 
-        # 设置文件
         self.cdp.send("DOM.setFileInputFiles", {
             "backendNodeId": backend_node_id,
             "files": [file_path]
         })
-
-    # ==================== 多标签页 ====================
-
-    def new_tab(self, url: str = "about:blank", switch: bool = False) -> str:
-        """新建标签页，返回 target_id
-
-        Args:
-            url: 新标签页的 URL
-            switch: 是否自动切换到新标签页
-        """
-        result = self.cdp.send("Target.createTarget", {"url": url})
-        target_id = result["targetId"]
-
-        if switch:
-            time.sleep(0.1)  # 等待标签页准备好
-            self.switch_tab(target_id)
-
-        return target_id
-
-    def get_tabs(self) -> list:
-        """获取所有标签页"""
-        result = self.cdp.send("Target.getTargets")
-        return [t for t in result["targetInfos"] if t["type"] == "page"]
-
-    def switch_tab(self, target_id: str):
-        """切换到指定标签页"""
-        # 如果该 tab 还没有连接，建立新连接
-        if target_id not in self._sessions:
-            self._connect(target_id)
-        else:
-            self._current_target_id = target_id
-            self._update_frame_tree()
-
-        # 激活窗口（让用户可见）
-        self.cdp.send("Target.activateTarget", {"targetId": target_id})
-
-    def close_tab(self, target_id: str):
-        """关闭指定标签页"""
-        # 先关闭浏览器标签页（用当前连接发送命令）
-        self.cdp.send("Target.closeTarget", {"targetId": target_id})
-
-        # 关闭该 tab 的 WebSocket 连接
-        if target_id in self._sessions:
-            self._sessions[target_id].close()
-            del self._sessions[target_id]
-
-        # 如果关闭的是当前 tab，切换到其他 tab
-        if target_id == self._current_target_id:
-            if self._sessions:
-                self._current_target_id = next(iter(self._sessions))
-                self._update_frame_tree()
-            else:
-                self._current_target_id = None
 
     # ==================== 弹窗处理 ====================
 
@@ -764,7 +530,7 @@ class MiniBrowser:
         })
 
     def wait_for_dialog(self, timeout: float = 10) -> dict:
-        """等待弹窗出现，返回弹窗信息"""
+        """等待弹窗出现"""
         start = time.time()
         while time.time() - start < timeout:
             self.cdp.poll_events()
@@ -775,7 +541,7 @@ class MiniBrowser:
             time.sleep(0.1)
         raise Exception("等待弹窗超时")
 
-    # ==================== 更多等待条件 ====================
+    # ==================== 等待条件 ====================
 
     def wait_for_text(self, text: str, timeout: float = 10):
         """等待页面出现指定文本"""
@@ -787,26 +553,6 @@ class MiniBrowser:
             time.sleep(0.1)
         raise Exception(f"等待文本超时: {text}")
 
-    def wait_for_text_gone(self, text: str, timeout: float = 10):
-        """等待指定文本消失"""
-        start = time.time()
-        while time.time() - start < timeout:
-            content = self._evaluate("document.body.innerText || ''")
-            if text not in content:
-                return
-            time.sleep(0.1)
-        raise Exception(f"等待文本消失超时: {text}")
-
-    def wait_for_selector_gone(self, selector: str, timeout: float = 10):
-        """等待元素消失"""
-        start = time.time()
-        while time.time() - start < timeout:
-            elem = self.query_selector(selector)
-            if elem is None:
-                return
-            time.sleep(0.1)
-        raise Exception(f"等待元素消失超时: {selector}")
-
     def wait_for_url(self, url_pattern: str, timeout: float = 10):
         """等待 URL 包含指定字符串"""
         start = time.time()
@@ -817,23 +563,182 @@ class MiniBrowser:
             time.sleep(0.1)
         raise Exception(f"等待URL超时: {url_pattern}")
 
+    def activate(self):
+        """激活此标签页（使其可见）"""
+        self.cdp.send("Target.activateTarget", {"targetId": self.target_id})
+
+    def close(self):
+        """关闭此标签页"""
+        self.cdp.send("Target.closeTarget", {"targetId": self.target_id})
+        self.cdp.close()
+
+
+class MiniBrowser:
+    """浏览器管理器"""
+
+    def __init__(self, debug_port: int = 9222, timeout: float = 30):
+        self.debug_port = debug_port
+        self.timeout = timeout
+        self.process: Optional[subprocess.Popen] = None
+        self._tabs: dict[str, Tab] = {}  # target_id -> Tab
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    # ==================== 启动与连接 ====================
+
+    def launch(self, kill_existing: bool = True, browser: str = "auto") -> 'Tab':
+        """启动浏览器并返回初始标签页"""
+        if browser == "auto":
+            browser_path = self._find_browser()
+        elif browser == "chrome":
+            browser_path = self._find_browser("chrome")
+        elif browser == "edge":
+            browser_path = self._find_browser("edge")
+        else:
+            browser_path = browser
+
+        process_name = "msedge.exe" if "edge" in browser_path.lower() else "chrome.exe"
+
+        if kill_existing:
+            os.system(f"taskkill /f /im {process_name} 2>nul")
+            for _ in range(10):
+                result = subprocess.run("tasklist", capture_output=True, text=True, shell=True)
+                if process_name not in result.stdout:
+                    break
+                time.sleep(0.1)
+
+        args = [
+            browser_path,
+            f"--remote-debugging-port={self.debug_port}",
+        ]
+        self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        last_error = None
+        for _ in range(20):
+            try:
+                return self._connect_first_tab()
+            except Exception as e:
+                last_error = e
+                time.sleep(0.1)
+        raise Exception(f"浏览器启动超时: {last_error}")
+
+    def _find_browser(self, browser_type: str = "auto") -> str:
+        """查找浏览器路径"""
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        ]
+        edge_paths = [
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+
+        if browser_type == "chrome":
+            paths = chrome_paths
+        elif browser_type == "edge":
+            paths = edge_paths
+        else:
+            paths = chrome_paths + edge_paths
+
+        for p in paths:
+            if os.path.exists(p):
+                return p
+        raise Exception(f"未找到浏览器: {browser_type}")
+
+    def connect(self) -> 'Tab':
+        """连接到已运行的浏览器，返回第一个标签页"""
+        return self._connect_first_tab()
+
+    def _get_targets(self) -> list:
+        """获取所有调试目标"""
+        conn = http.client.HTTPConnection("127.0.0.1", self.debug_port)
+        conn.request("GET", "/json")
+        response = conn.getresponse()
+        targets = json.loads(response.read().decode())
+        conn.close()
+        return targets
+
+    def _connect_first_tab(self) -> 'Tab':
+        """连接到第一个可用的标签页"""
+        targets = self._get_targets()
+
+        page_target = None
+        for target in targets:
+            if target.get("type") == "page":
+                page_target = target
+                break
+
+        if not page_target:
+            raise Exception("未找到可用的页面")
+
+        return self._create_tab(page_target)
+
+    def _create_tab(self, target: dict) -> 'Tab':
+        """根据 target 信息创建 Tab 对象"""
+        tid = target["id"]
+        ws_url = target["webSocketDebuggerUrl"]
+
+        cdp = CDPSession(ws_url, self.timeout)
+        cdp.send("Page.enable")
+        cdp.send("Runtime.enable")
+        cdp.send("DOM.enable")
+
+        tab = Tab(cdp, tid)
+        tab._update_frame_tree()
+
+        self._tabs[tid] = tab
+        return tab
+
+    # ==================== 标签页管理 ====================
+
+    def new_tab(self, url: str = "about:blank") -> 'Tab':
+        """新建标签页并返回 Tab 对象"""
+        # 使用任意现有 tab 的 cdp 发送命令
+        if not self._tabs:
+            raise Exception("没有可用的标签页")
+
+        any_tab = next(iter(self._tabs.values()))
+        result = any_tab.cdp.send("Target.createTarget", {"url": url})
+        target_id = result["targetId"]
+
+        time.sleep(0.1)  # 等待标签页准备好
+
+        # 获取新标签页的 WebSocket URL
+        targets = self._get_targets()
+        for target in targets:
+            if target.get("id") == target_id:
+                return self._create_tab(target)
+
+        raise Exception("无法连接到新标签页")
+
+    def get_tabs(self) -> list['Tab']:
+        """获取所有已连接的标签页"""
+        return list(self._tabs.values())
+
+    def close_tab(self, tab: 'Tab'):
+        """关闭指定标签页"""
+        tab.close()
+        self._tabs.pop(tab.target_id, None)
+
     def close(self):
         """关闭浏览器"""
-        # 尝试发送关闭命令
-        if self._sessions:
+        if self._tabs:
             try:
-                self.cdp.send("Browser.close")
+                any_tab = next(iter(self._tabs.values()))
+                any_tab.cdp.send("Browser.close")
             except Exception:
-                pass  # 浏览器可能已关闭
+                pass
 
-            # 关闭所有 WebSocket 连接
-            for session in self._sessions.values():
+            for tab in self._tabs.values():
                 try:
-                    session.close()
+                    tab.cdp.close()
                 except Exception:
-                    pass  # 连接可能已断开
-            self._sessions.clear()
-            self._current_target_id = None
+                    pass
+            self._tabs.clear()
 
         if self.process:
             try:

@@ -7,78 +7,145 @@
 ## 特性
 
 - **零依赖** - 仅使用 Python 标准库，无需安装任何第三方包
-- **轻量级** - 单文件实现，代码简洁易懂
+- **轻量级** - 单文件 ~750 行，复制即用
+- **多标签页** - 每个 Tab 独立对象，支持并行操作
 - **学习友好** - 适合学习 WebSocket、CDP 协议和浏览器自动化原理
-
-## 已实现功能
-
-| 功能 | 方法 | 说明 |
-|------|------|------|
-| 启动浏览器 | `launch()` | 自动检测 Chrome/Edge |
-| 页面导航 | `goto(url)` | 导航到指定 URL |
-| 元素点击 | `click(selector)` | CSS 选择器定位并点击 |
-| 文本输入 | `type_text(selector, text)` | 模拟键盘逐字输入 |
-| 快速填充 | `fill(selector, value)` | 直接设置输入框值 |
-| 下拉选择 | `select(selector, value)` | 选择下拉框选项 |
-| 复选框 | `check(selector, checked)` | 勾选/取消复选框 |
-| 获取文本 | `get_text(selector)` | 获取元素文本内容 |
-| 获取属性 | `get_attribute(selector, attr)` | 获取元素属性值 |
-| 等待元素 | `wait_for_selector(selector)` | 等待元素出现 |
-| iframe 切换 | `switch_to_frame()` | 支持 selector/name/index |
-| 截图 | `screenshot(path)` | 页面截图保存为 PNG |
-| 执行 JS | `execute_script(script)` | 执行自定义 JavaScript |
 
 ## 快速开始
 
 ```python
-from tinydrama import create_browser
+from tinydrama import MiniBrowser
 
-browser = create_browser()
+browser = MiniBrowser()
+tab = browser.launch(browser="edge")  # 返回 Tab 对象
 
-try:
-    browser.goto("https://www.baidu.com")
-    browser.fill("#kw", "Python")
-    browser.click("#su")
-    browser.wait(2)
-    browser.screenshot("result.png")
-finally:
-    browser.close()
+tab.goto("https://www.baidu.com")
+tab.fill("#kw", "Python")
+tab.click("#su")
+tab.wait_for_text("百度百科")
+tab.screenshot("result.png")
+
+browser.close()
+```
+
+## 多标签页
+
+```python
+browser = MiniBrowser()
+tab1 = browser.launch()
+
+# 每个 Tab 是独立对象
+tab2 = browser.new_tab("https://example.com")
+
+# 可以交替操作，状态互不影响
+tab1.goto("https://site-a.com")
+tab1.fill("#user", "alice")
+
+tab2.fill("#search", "query")
+tab2.click("#go")
+
+browser.close()
+```
+
+## API 参考
+
+### MiniBrowser（浏览器管理器）
+
+| 方法 | 说明 |
+|------|------|
+| `launch(browser="auto")` | 启动浏览器，返回初始 Tab |
+| `connect()` | 连接已运行的浏览器，返回 Tab |
+| `new_tab(url)` | 新建标签页，返回 Tab |
+| `get_tabs()` | 获取所有已连接的 Tab |
+| `close_tab(tab)` | 关闭指定标签页 |
+| `close()` | 关闭浏览器 |
+
+### Tab（页面操作）
+
+**导航**
+
+| 方法 | 说明 |
+|------|------|
+| `goto(url)` | 导航到 URL |
+| `wait_for_load()` | 等待页面加载完成 |
+| `wait_for_url(pattern)` | 等待 URL 包含指定字符串 |
+
+**元素操作**
+
+| 方法 | 说明 |
+|------|------|
+| `click(selector)` | 点击元素 |
+| `fill(selector, value)` | 填充输入框 |
+| `select(selector, value)` | 选择下拉框选项 |
+| `check(selector, checked)` | 勾选/取消复选框 |
+
+**元素读取**
+
+| 方法 | 说明 |
+|------|------|
+| `query_selector(selector)` | 查询元素信息 |
+| `wait_for_selector(selector)` | 等待元素出现 |
+| `get_text(selector)` | 获取元素文本 |
+| `get_value(selector)` | 获取输入框的值 |
+| `get_attribute(selector, attr)` | 获取元素属性 |
+| `wait_for_text(text)` | 等待页面出现指定文本 |
+
+**iframe**
+
+| 方法 | 说明 |
+|------|------|
+| `switch_to_frame(selector/name/index)` | 切换到 iframe |
+| `switch_to_main_frame()` | 切换回主页面 |
+
+**文件与截图**
+
+| 方法 | 说明 |
+|------|------|
+| `screenshot(path)` | 页面截图 |
+| `upload_file(selector, path)` | 上传文件 |
+| `enable_download(path)` | 启用下载到指定目录 |
+| `wait_for_download()` | 等待下载完成 |
+
+**其他**
+
+| 方法 | 说明 |
+|------|------|
+| `execute_script(js)` | 执行 JavaScript |
+| `handle_dialog(accept)` | 处理弹窗 |
+| `wait_for_dialog()` | 等待弹窗出现 |
+| `activate()` | 激活此标签页 |
+| `close()` | 关闭此标签页 |
+
+## 架构
+
+```
+MiniBrowser（浏览器管理器）
+    │
+    ├── Tab（页面对象，包含所有操作方法）
+    │   └── CDPSession（CDP 通信）
+    │       └── WebSocketClient（WebSocket 协议）
+    │
+    └── Tab（每个标签页独立）
+        └── CDPSession
 ```
 
 ## 环境要求
 
-- Python 3.7+
-- Chrome 或 Edge 浏览器
+- Python 3.10+
+- Windows + Chrome 或 Edge 浏览器
 
-## 项目结构
-
-```
-tinydrama/
-├── tinydrama.py    # 主程序
-└── README.md
-```
-
-## 核心组件
+## 项目文件
 
 ```
-┌─────────────────┐
-│   MiniBrowser   │  高级 API（click, fill, goto...）
-├─────────────────┤
-│   CDPSession    │  CDP 协议封装（命令/响应/事件）
-├─────────────────┤
-│ WebSocketClient │  WebSocket 协议实现
-├─────────────────┤
-│     socket      │  TCP 连接
-└─────────────────┘
+tinydrama.py    # 主程序，单文件即可使用
+README.md       # 文档
 ```
 
-## 学习价值
+## 适用场景
 
-通过这个项目可以学习：
-
-- **网络协议**: TCP Socket、HTTP、WebSocket 握手与帧解析
-- **浏览器原理**: Chrome DevTools Protocol、DOM 操作
-- **异步编程**: 事件驱动、请求/响应模型
+- 个人自动化办公（填表、下载报表）
+- 简单的数据抓取
+- 学习浏览器自动化原理
 
 ## License
 
