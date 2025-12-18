@@ -18,3 +18,4 @@ env/
 *.png
 *.pdf
 .claude/
+test.py

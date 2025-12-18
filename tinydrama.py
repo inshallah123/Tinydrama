@@ -13,6 +13,7 @@ import http.client
 import os
 from urllib.parse import urlparse
 from typing import Optional, Any
+from dataclasses import dataclass, field
 
 
 class WebSocketClient:
@@ -125,11 +126,11 @@ class CDPSession:
         self.ws.connect()
         self._msg_id = 0
         self._responses = {}
-        # CDP 事件状态
-        self._frame_contexts: dict[str, int] = {}  # frame_id -> context_id
-        self._pending_downloads: dict[str, dict] = {}
-        self._completed_downloads: dict[str, dict] = {}
-        self._pending_dialog: Optional[dict] = None
+        self._event_handlers: list = []
+
+    def on_event(self, handler):
+        """注册事件回调"""
+        self._event_handlers.append(handler)
 
     def send(self, method: str, params: Optional[dict] = None) -> dict:
         """发送CDP命令并等待响应"""
@@ -149,7 +150,7 @@ class CDPSession:
                 if "id" in msg:
                     self._responses[msg["id"]] = msg
                 else:
-                    self._handle_event(msg)
+                    self._dispatch_event(msg)
             except socket.timeout:
                 raise Exception(f"等待响应超时: {method}")
 
@@ -169,7 +170,7 @@ class CDPSession:
                 if "id" in msg:
                     self._responses[msg["id"]] = msg
                 else:
-                    self._handle_event(msg)
+                    self._dispatch_event(msg)
         except (socket.timeout, BlockingIOError):
             # socket.timeout: 阻塞模式下超时
             # BlockingIOError: 非阻塞模式下无数据可读 (timeout=0)
@@ -177,8 +178,40 @@ class CDPSession:
         finally:
             self.ws.sock.settimeout(self.ws.timeout)
 
-    def _handle_event(self, event: dict):
-        """处理 CDP 事件"""
+    def _dispatch_event(self, event: dict):
+        """分发事件给所有注册的处理器"""
+        for handler in self._event_handlers:
+            handler(event)
+
+    def close(self):
+        self.ws.close()
+
+
+@dataclass
+class TabState:
+    """Tab 业务状态 - 集中管理所有状态"""
+    # 页面状态
+    frame_tree: dict = field(default_factory=dict)
+    current_frame_id: Optional[str] = None
+    # CDP 事件状态
+    frame_contexts: dict[str, int] = field(default_factory=dict)  # frame_id -> context_id
+    pending_downloads: dict[str, dict] = field(default_factory=dict)
+    completed_downloads: dict[str, dict] = field(default_factory=dict)
+    pending_dialog: Optional[dict] = None
+
+
+class Tab:
+    """单个标签页 - 包含所有页面操作方法"""
+
+    def __init__(self, cdp: CDPSession, target_id: str):
+        self.cdp = cdp
+        self.target_id = target_id
+        self.state = TabState()
+        # 注册事件处理
+        cdp.on_event(self._on_event)
+
+    def _on_event(self, event: dict):
+        """处理 CDP 事件，更新状态"""
         method = event.get("method")
         params = event.get("params", {})
 
@@ -188,39 +221,28 @@ class CDPSession:
             frame_id = aux_data.get("frameId")
             is_default = aux_data.get("isDefault", False)
             if frame_id and is_default:
-                self._frame_contexts[frame_id] = ctx["id"]
+                self.state.frame_contexts[frame_id] = ctx["id"]
 
         elif method == "Runtime.executionContextDestroyed":
             ctx_id = params.get("executionContextId")
-            self._frame_contexts = {k: v for k, v in self._frame_contexts.items() if v != ctx_id}
+            self.state.frame_contexts = {
+                k: v for k, v in self.state.frame_contexts.items() if v != ctx_id
+            }
 
         elif method == "Browser.downloadWillBegin":
             guid = params.get("guid")
             if guid:
-                self._pending_downloads[guid] = params
+                self.state.pending_downloads[guid] = params
 
         elif method == "Browser.downloadProgress":
             guid = params.get("guid")
             state = params.get("state")
             if guid and state == "completed":
-                self._completed_downloads[guid] = params
-                self._pending_downloads.pop(guid, None)
+                self.state.completed_downloads[guid] = params
+                self.state.pending_downloads.pop(guid, None)
 
         elif method == "Page.javascriptDialogOpening":
-            self._pending_dialog = params
-
-    def close(self):
-        self.ws.close()
-
-
-class Tab:
-    """单个标签页 - 包含所有页面操作方法"""
-
-    def __init__(self, cdp: CDPSession, target_id: str):
-        self.cdp = cdp
-        self.target_id = target_id
-        self._frame_tree: dict = {}
-        self._current_frame_id: Optional[str] = None
+            self.state.pending_dialog = params
 
     # ==================== 页面导航 ====================
 
@@ -233,8 +255,8 @@ class Tab:
     def _update_frame_tree(self):
         """更新 frame 树"""
         result = self.cdp.send("Page.getFrameTree")
-        self._frame_tree = result.get("frameTree", {})
-        self._current_frame_id = self._frame_tree.get("frame", {}).get("id")
+        self.state.frame_tree = result.get("frameTree", {})
+        self.state.current_frame_id = self.state.frame_tree.get("frame", {}).get("id")
 
     def wait_for_load(self, timeout: float = 30):
         """等待页面加载完成"""
@@ -256,8 +278,8 @@ class Tab:
             "returnByValue": return_by_value,
         }
 
-        if self._current_frame_id and self._current_frame_id in self.cdp._frame_contexts:
-            params["contextId"] = self.cdp._frame_contexts[self._current_frame_id]
+        if self.state.current_frame_id and self.state.current_frame_id in self.state.frame_contexts:
+            params["contextId"] = self.state.frame_contexts[self.state.current_frame_id]
 
         try:
             result = self.cdp.send("Runtime.evaluate", params)
@@ -265,8 +287,8 @@ class Tab:
             # context 失效时（页面导航中），等待新 context 事件到达后重试
             if "Cannot find context" in str(e):
                 self.cdp.poll_events(timeout=0.5)
-                if self._current_frame_id and self._current_frame_id in self.cdp._frame_contexts:
-                    params["contextId"] = self.cdp._frame_contexts[self._current_frame_id]
+                if self.state.current_frame_id and self.state.current_frame_id in self.state.frame_contexts:
+                    params["contextId"] = self.state.frame_contexts[self.state.current_frame_id]
                 else:
                     params.pop("contextId", None)
                 result = self.cdp.send("Runtime.evaluate", params)
@@ -441,25 +463,25 @@ class Tab:
             if not frame_id:
                 raise Exception(f"元素不是iframe: {selector}")
 
-            self._current_frame_id = frame_id
+            self.state.current_frame_id = frame_id
 
         elif name is not None:
             frames = []
-            self._collect_frames(self._frame_tree, frames)
+            self._collect_frames(self.state.frame_tree, frames)
             for frame in frames:
                 if frame["name"] == name:
-                    self._current_frame_id = frame["id"]
+                    self.state.current_frame_id = frame["id"]
                     break
             else:
                 raise Exception(f"未找到name为'{name}'的iframe")
 
         elif index is not None:
             frames = []
-            self._collect_frames(self._frame_tree, frames)
+            self._collect_frames(self.state.frame_tree, frames)
             child_frames = [f for f in frames if f["depth"] > 0]
             if index >= len(child_frames):
                 raise Exception(f"iframe索引越界: {index}")
-            self._current_frame_id = child_frames[index]["id"]
+            self.state.current_frame_id = child_frames[index]["id"]
 
         else:
             raise Exception("必须指定selector、name或index之一")
@@ -467,14 +489,14 @@ class Tab:
         # 等待 iframe 的 context 就绪
         for _ in range(int(timeout * 10)):
             self.cdp.poll_events(timeout=0.1)
-            if self._current_frame_id in self.cdp._frame_contexts:
+            if self.state.current_frame_id in self.state.frame_contexts:
                 return
-        raise Exception(f"iframe context 未就绪: {self._current_frame_id}")
+        raise Exception(f"iframe context 未就绪: {self.state.current_frame_id}")
 
     def switch_to_main_frame(self):
         """切换回主frame"""
         self._update_frame_tree()
-        self._current_frame_id = self._frame_tree.get("frame", {}).get("id")
+        self.state.current_frame_id = self.state.frame_tree.get("frame", {}).get("id")
 
     # ==================== 其他操作 ====================
 
@@ -501,7 +523,7 @@ class Tab:
 
     def wait_for_download(self, timeout: float = 60) -> dict:
         """等待下载完成"""
-        my_frame_id = self._current_frame_id
+        my_frame_id = self.state.current_frame_id
         if not my_frame_id:
             raise Exception("未初始化frame，请先导航到页面")
         guid = None
@@ -509,10 +531,10 @@ class Tab:
 
         while time.time() - start < timeout:
             self.cdp.poll_events()
-            for g, info in list(self.cdp._pending_downloads.items()):
+            for g, info in list(self.state.pending_downloads.items()):
                 if info.get("frameId") == my_frame_id:
                     guid = g
-                    del self.cdp._pending_downloads[g]
+                    del self.state.pending_downloads[g]
                     break
             if guid:
                 break
@@ -523,8 +545,8 @@ class Tab:
 
         while time.time() - start < timeout:
             self.cdp.poll_events()
-            if guid in self.cdp._completed_downloads:
-                result = self.cdp._completed_downloads.pop(guid)
+            if guid in self.state.completed_downloads:
+                result = self.state.completed_downloads.pop(guid)
                 return result
             time.sleep(0.1)
 
@@ -561,9 +583,9 @@ class Tab:
         start = time.time()
         while time.time() - start < timeout:
             self.cdp.poll_events()
-            if self.cdp._pending_dialog:
-                result = self.cdp._pending_dialog
-                self.cdp._pending_dialog = None
+            if self.state.pending_dialog:
+                result = self.state.pending_dialog
+                self.state.pending_dialog = None
                 return result
             time.sleep(0.1)
         raise Exception("等待弹窗超时")
@@ -647,7 +669,7 @@ class Tab:
         elements = self.query_all(selector)
         visible = [el for el in elements if el.get("visible")]
         count = 0
-        for el in visible:
+        for _ in visible:
             try:
                 self._scroll_into_view(selector)
                 # 重新获取坐标（滚动后可能变化）
@@ -811,6 +833,7 @@ class MiniBrowser:
         args = [
             browser_path,
             f"--remote-debugging-port={self.debug_port}",
+            "--disable-restore-session-state",
         ]
         self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
