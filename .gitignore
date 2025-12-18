@@ -19,3 +19,7 @@ env/
 *.pdf
 .claude/
 test.py
+auto_query.py
+explore_form.py
+explore_query_export.py
+downloads_temp/

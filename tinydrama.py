@@ -132,14 +132,16 @@ class CDPSession:
         """注册事件回调"""
         self._event_handlers.append(handler)
 
-    def send(self, method: str, params: Optional[dict] = None) -> dict:
-        """发送CDP命令并等待响应"""
+    def send(self, method: str, params: Optional[dict] = None, session_id: Optional[str] = None) -> dict:
+        """发送CDP命令并等待响应，可指定 sessionId 发送到子 target（如跨域 iframe）"""
         self._msg_id += 1
         msg_id = self._msg_id
 
         message = {"id": msg_id, "method": method}
         if params:
             message["params"] = params
+        if session_id:
+            message["sessionId"] = session_id
         self.ws.send(json.dumps(message))
 
         while msg_id not in self._responses:
@@ -195,6 +197,8 @@ class TabState:
     current_frame_id: Optional[str] = None
     # CDP 事件状态
     frame_contexts: dict[str, int] = field(default_factory=dict)  # frame_id -> context_id
+    frame_sessions: dict[str, str] = field(default_factory=dict)  # frame_id -> session_id (跨域 iframe)
+    pending_sessions: set[str] = field(default_factory=set)  # 待启用 Runtime 的 session_id
     pending_downloads: dict[str, dict] = field(default_factory=dict)
     completed_downloads: dict[str, dict] = field(default_factory=dict)
     pending_dialog: Optional[dict] = None
@@ -215,15 +219,7 @@ class Tab:
         method = event.get("method")
         params = event.get("params", {})
 
-        if method == "Runtime.executionContextCreated":
-            ctx = params["context"]
-            aux_data = ctx.get("auxData", {})
-            frame_id = aux_data.get("frameId")
-            is_default = aux_data.get("isDefault", False)
-            if frame_id and is_default:
-                self.state.frame_contexts[frame_id] = ctx["id"]
-
-        elif method == "Runtime.executionContextDestroyed":
+        if method == "Runtime.executionContextDestroyed":
             ctx_id = params.get("executionContextId")
             self.state.frame_contexts = {
                 k: v for k, v in self.state.frame_contexts.items() if v != ctx_id
@@ -243,6 +239,36 @@ class Tab:
 
         elif method == "Page.javascriptDialogOpening":
             self.state.pending_dialog = params
+
+        elif method == "Target.attachedToTarget":
+            # 跨域 iframe 自动附加时记录 session（延迟启用 Runtime，避免阻塞）
+            session_id = params.get("sessionId")
+            target_info = params.get("targetInfo", {})
+            if target_info.get("type") == "iframe" and session_id:
+                # 记录待启用的 session，稍后在 switch_to_frame 时启用
+                self.state.pending_sessions.add(session_id)
+
+        elif method == "Runtime.executionContextCreated":
+            # 检查是否来自子 session（跨域 iframe）
+            session_id = event.get("sessionId")
+            ctx = params["context"]
+            aux_data = ctx.get("auxData", {})
+            frame_id = aux_data.get("frameId")
+            is_default = aux_data.get("isDefault", False)
+            if frame_id:
+                if session_id:
+                    # 跨域 iframe 的 context
+                    self.state.frame_sessions[frame_id] = session_id
+                if is_default or frame_id not in self.state.frame_contexts:
+                    self.state.frame_contexts[frame_id] = ctx["id"]
+
+    # ==================== 辅助方法 ====================
+
+    def _get_session_id(self) -> Optional[str]:
+        """获取当前 frame 的 session_id（跨域 iframe 需要）"""
+        if self.state.current_frame_id:
+            return self.state.frame_sessions.get(self.state.current_frame_id)
+        return None
 
     # ==================== 页面导航 ====================
 
@@ -278,11 +304,13 @@ class Tab:
             "returnByValue": return_by_value,
         }
 
+        # 检查是否是跨域 iframe（有对应的 sessionId）
+        session_id = self._get_session_id()
         if self.state.current_frame_id and self.state.current_frame_id in self.state.frame_contexts:
             params["contextId"] = self.state.frame_contexts[self.state.current_frame_id]
 
         try:
-            result = self.cdp.send("Runtime.evaluate", params)
+            result = self.cdp.send("Runtime.evaluate", params, session_id=session_id)
         except Exception as e:
             # context 失效时（页面导航中），等待新 context 事件到达后重试
             if "Cannot find context" in str(e):
@@ -291,7 +319,7 @@ class Tab:
                     params["contextId"] = self.state.frame_contexts[self.state.current_frame_id]
                 else:
                     params.pop("contextId", None)
-                result = self.cdp.send("Runtime.evaluate", params)
+                result = self.cdp.send("Runtime.evaluate", params, session_id=session_id)
             else:
                 raise
 
@@ -355,7 +383,7 @@ class Tab:
         result = self._evaluate(f"document.querySelector({json.dumps(selector)})", return_by_value=False)
         object_id = result.get("objectId")
         if object_id:
-            self.cdp.send("DOM.scrollIntoViewIfNeeded", {"objectId": object_id})
+            self.cdp.send("DOM.scrollIntoViewIfNeeded", {"objectId": object_id}, session_id=self._get_session_id())
 
     def click(self, selector: str):
         """点击元素"""
@@ -473,6 +501,10 @@ class Tab:
                     self.state.current_frame_id = frame["id"]
                     break
             else:
+                # 检查是否存在跨域 iframe
+                iframe_count = self._evaluate("document.querySelectorAll('iframe').length") or 0
+                if iframe_count > 0:
+                    raise Exception(f"未找到name为'{name}'的iframe（页面存在{iframe_count}个iframe，可能是跨域iframe，请改用 selector 方式定位）")
                 raise Exception(f"未找到name为'{name}'的iframe")
 
         elif index is not None:
@@ -480,18 +512,36 @@ class Tab:
             self._collect_frames(self.state.frame_tree, frames)
             child_frames = [f for f in frames if f["depth"] > 0]
             if index >= len(child_frames):
+                # 检查是否存在跨域 iframe
+                iframe_count = self._evaluate("document.querySelectorAll('iframe').length") or 0
+                if iframe_count > 0 and len(child_frames) < iframe_count:
+                    raise Exception(f"iframe索引越界: {index}（frame_tree中只有{len(child_frames)}个iframe，但DOM中有{iframe_count}个，可能存在跨域iframe，请改用 selector 方式定位）")
                 raise Exception(f"iframe索引越界: {index}")
             self.state.current_frame_id = child_frames[index]["id"]
 
         else:
             raise Exception("必须指定selector、name或index之一")
 
-        # 等待 iframe 的 context 就绪
-        for _ in range(int(timeout * 10)):
+        # 启用 pending sessions 的 Runtime（延迟执行，避免事件处理中阻塞）
+        for sid in list(self.state.pending_sessions):
+            try:
+                self.cdp.send("Runtime.enable", session_id=sid)
+                self.state.pending_sessions.discard(sid)
+            except Exception:
+                pass
+
+        # 等待 iframe 的 context 就绪（同域或跨域 iframe）
+        start = time.time()
+        while time.time() - start < timeout:
             self.cdp.poll_events(timeout=0.1)
+            # 同域 iframe：检查 frame_contexts
+            # 跨域 iframe：检查 frame_sessions（通过 Target.attachedToTarget 事件获取）
             if self.state.current_frame_id in self.state.frame_contexts:
                 return
-        raise Exception(f"iframe context 未就绪: {self.state.current_frame_id}")
+            if self.state.current_frame_id in self.state.frame_sessions:
+                return
+
+        raise Exception(f"iframe context 未就绪: {self.state.current_frame_id}（如果是跨域 iframe，请确保 iframe 内容已加载）")
 
     def switch_to_main_frame(self):
         """切换回主frame"""
@@ -501,8 +551,8 @@ class Tab:
     # ==================== 其他操作 ====================
 
     def screenshot(self, path: Optional[str] = None) -> bytes:
-        """截图"""
-        result = self.cdp.send("Page.captureScreenshot", {"format": "png"})
+        """截图（支持跨域 iframe）"""
+        result = self.cdp.send("Page.captureScreenshot", {"format": "png"}, session_id=self._get_session_id())
         data = base64.b64decode(result["data"])
         if path:
             with open(path, "wb") as f:
@@ -514,34 +564,47 @@ class Tab:
         return self._evaluate(script)
 
     def enable_download(self, download_path: str):
-        """启用下载并指定保存目录（浏览器全局设置）"""
-        self.cdp.send("Browser.setDownloadBehavior", {
+        """启用下载并指定保存目录
+
+        注意：对于跨域 iframe，会同时在主 session 和 iframe session 上启用
+        """
+        params = {
             "behavior": "allow",
             "downloadPath": download_path,
             "eventsEnabled": True
-        })
+        }
+        # 主 session
+        self.cdp.send("Browser.setDownloadBehavior", params)
+
+        # 跨域 iframe session（如果有）
+        for session_id in set(self.state.frame_sessions.values()):
+            self.cdp.send("Browser.setDownloadBehavior", params, session_id=session_id)
 
     def wait_for_download(self, timeout: float = 60) -> dict:
-        """等待下载完成"""
-        my_frame_id = self.state.current_frame_id
-        if not my_frame_id:
-            raise Exception("未初始化frame，请先导航到页面")
+        """等待下载完成
+
+        Args:
+            timeout: 超时时间（秒）
+
+        Returns:
+            下载完成信息，包含 guid, totalBytes, receivedBytes, state 等
+
+        注意：当前实现接受任意下载事件。如果需要多 Tab 并行下载，
+        需要更复杂的 frameId 跟踪机制（iframe 内导航会改变 frameId）。
+        """
         guid = None
         start = time.time()
 
         while time.time() - start < timeout:
             self.cdp.poll_events()
-            for g, info in list(self.state.pending_downloads.items()):
-                if info.get("frameId") == my_frame_id:
-                    guid = g
-                    del self.state.pending_downloads[g]
-                    break
-            if guid:
+            # 接受第一个检测到的下载
+            if self.state.pending_downloads:
+                guid, _ = self.state.pending_downloads.popitem()
                 break
             time.sleep(0.1)
 
         if not guid:
-            raise Exception("未检测到下载开始")
+            raise TimeoutError("未检测到下载开始")
 
         while time.time() - start < timeout:
             self.cdp.poll_events()
@@ -550,7 +613,7 @@ class Tab:
                 return result
             time.sleep(0.1)
 
-        raise Exception("下载超时")
+        raise TimeoutError("下载超时")
 
     def upload_file(self, selector: str, file_path: str):
         """上传文件"""
@@ -561,22 +624,23 @@ class Tab:
         if not object_id:
             raise Exception(f"未找到文件输入元素: {selector}")
 
-        node_info = self.cdp.send("DOM.describeNode", {"objectId": object_id})
+        session_id = self._get_session_id()
+        node_info = self.cdp.send("DOM.describeNode", {"objectId": object_id}, session_id=session_id)
         backend_node_id = node_info["node"]["backendNodeId"]
 
         self.cdp.send("DOM.setFileInputFiles", {
             "backendNodeId": backend_node_id,
             "files": [file_path]
-        })
+        }, session_id=session_id)
 
     # ==================== 弹窗处理 ====================
 
     def handle_dialog(self, accept: bool = True, prompt_text: str = ""):
-        """处理弹窗（alert/confirm/prompt）"""
+        """处理弹窗（alert/confirm/prompt，支持跨域 iframe）"""
         self.cdp.send("Page.handleJavaScriptDialog", {
             "accept": accept,
             "promptText": prompt_text
-        })
+        }, session_id=self._get_session_id())
 
     def wait_for_dialog(self, timeout: float = 10) -> dict:
         """等待弹窗出现"""
@@ -903,11 +967,23 @@ class MiniBrowser:
         ws_url = target["webSocketDebuggerUrl"]
 
         cdp = CDPSession(ws_url, self.timeout)
+
+        # 先创建 Tab，注册事件处理器
+        tab = Tab(cdp, tid)
+
+        # 再发送 enable 命令，这样 executionContextCreated 事件才能被正确捕获
         cdp.send("Page.enable")
         cdp.send("Runtime.enable")
         cdp.send("DOM.enable")
 
-        tab = Tab(cdp, tid)
+        # 启用自动附加到跨域 iframe（flatten 模式，通过 sessionId 发送命令）
+        cdp.send("Target.setAutoAttach", {
+            "autoAttach": True,
+            "waitForDebuggerOnStart": False,
+            "flatten": True,
+            "filter": [{"type": "iframe", "exclude": False}]
+        })
+
         tab._update_frame_tree()
 
         self._tabs[tid] = tab
