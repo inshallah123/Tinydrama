@@ -8,7 +8,6 @@ import json
 import time
 import base64
 from typing import Optional, Any
-
 from .cdp import CDPSession
 
 
@@ -19,16 +18,16 @@ class Frame:
     通过 parent 属性区分根 frame（Tab）和子 frame（iframe）。
     """
 
-    def __init__(self, manager: 'FrameManager', frame_id: str, parent: Optional['Frame'] = None, target_id: Optional[str] = None):
+    def __init__(self, manager: 'FrameManager', frame_id: str, parent: Optional['Frame'] = None, target_id: Optional[str] = None, owner_selector: Optional[str] = None):
         self._manager = manager
         self._frame_id = frame_id
         self._parent = parent
         self._target_id = target_id  # 只有根 frame 有
+        self._owner_selector = owner_selector  # iframe 在父 frame 中的 selector
 
         # 动态状态 - 由 FrameManager 通过事件更新
         self._context_id: Optional[int] = None
         self._session_id: Optional[str] = None  # 跨域 iframe 才有
-        self._detached = False
 
     @property
     def is_root(self) -> bool:
@@ -49,7 +48,6 @@ class Frame:
 
     def _on_detached(self):
         """frame 被移除（由 FrameManager 调用）"""
-        self._detached = True
         self._context_id = None
 
     def _ensure_context(self, timeout: float = 5.0):
@@ -65,6 +63,29 @@ class Frame:
 
         raise Exception(f"Frame context 未就绪: {self._frame_id}")
 
+    def _get_viewport_offset(self) -> tuple[float, float]:
+        """获取当前 frame 相对于主视口的偏移量（用于 iframe 内的鼠标操作）"""
+        if self._parent is None:
+            return (0.0, 0.0)
+
+        # 递归获取父 frame 的偏移量
+        parent_offset = self._parent._get_viewport_offset()
+
+        # 从父 frame 查询 iframe 元素的位置
+        if self._owner_selector:
+            rect = self._parent._evaluate(f"""
+            (function() {{
+                const el = document.querySelector({json.dumps(self._owner_selector)});
+                if (!el) return null;
+                const rect = el.getBoundingClientRect();
+                return {{ x: rect.x, y: rect.y }};
+            }})()
+            """)
+            if rect:
+                return (parent_offset[0] + rect["x"], parent_offset[1] + rect["y"])
+
+        return parent_offset
+
     # ==================== JavaScript 执行 ====================
 
     def _evaluate(self, expression: str, return_by_value: bool = True) -> Any:
@@ -76,7 +97,7 @@ class Frame:
             "expression": expression,
             "returnByValue": return_by_value,
         }
-        if self._context_id:
+        if self._context_id is not None:
             params["contextId"] = self._context_id
 
         try:
@@ -109,7 +130,11 @@ class Frame:
 
     def goto(self, url: str):
         """导航到 URL"""
-        self.cdp.send("Page.navigate", {"url": url}, session_id=self._session_id)
+        params = {"url": url}
+        # 非根 frame 需要指定 frameId
+        if not self.is_root:
+            params["frameId"] = self._frame_id
+        self.cdp.send("Page.navigate", params, session_id=self._session_id)
         self.wait_for_load()
 
     def wait_for_load(self, timeout: float = 30):
@@ -178,38 +203,11 @@ class Frame:
             }};
         }})
         """
-        return self._evaluate(js) or []
+        result = self._evaluate(js)
+        if result is None:
+            raise Exception(f"查询元素失败: {selector}")
+        return result
 
-    def find_by_text(self, text: str, tag: str = "*", exact: bool = False) -> Optional[dict]:
-        """通过文本查找元素，返回元素信息"""
-        if exact:
-            condition = f"el.textContent?.trim() === {json.dumps(text)}"
-        else:
-            condition = f"el.textContent?.includes({json.dumps(text)})"
-
-        js = f"""
-        (function() {{
-            for (const el of document.querySelectorAll('{tag}')) {{
-                if ({condition}) {{
-                    const rect = el.getBoundingClientRect();
-                    return {{
-                        tag: el.tagName.toLowerCase(),
-                        id: el.id || null,
-                        class: el.className || null,
-                        text: el.textContent?.trim().substring(0, 100),
-                        x: rect.x + rect.width / 2,
-                        y: rect.y + rect.height / 2
-                    }};
-                }}
-            }}
-            return null;
-        }})()
-        """
-        return self._evaluate(js)
-
-    def count(self, selector: str) -> int:
-        """统计匹配元素数量"""
-        return self._evaluate(f"document.querySelectorAll({json.dumps(selector)}).length") or 0
 
     # ==================== 元素操作 ====================
 
@@ -217,46 +215,36 @@ class Frame:
         """滚动元素到视口内"""
         result = self._evaluate(f"document.querySelector({json.dumps(selector)})", return_by_value=False)
         object_id = result.get("objectId")
-        if object_id:
-            try:
-                self.cdp.send("DOM.scrollIntoViewIfNeeded", {"objectId": object_id}, session_id=self._session_id)
-            except Exception:
-                # 某些元素可能没有 layout object，忽略错误
-                pass
+        if not object_id:
+            raise Exception(f"无法获取元素 objectId: {selector}")
+        self.cdp.send("DOM.scrollIntoViewIfNeeded", {"objectId": object_id}, session_id=self._session_id)
 
-    def click(self, selector: str):
-        """点击元素"""
+    def click(self, selector: str, native: bool = False):
+        """点击元素
+
+        Args:
+            selector: CSS 选择器
+            native: 是否使用原生鼠标事件（默认 False 使用 JS 点击，更可靠）
+        """
         self.wait_for_selector(selector)
-        self._scroll_into_view(selector)
-        elem = self.query_selector(selector)
-        assert elem is not None
-        x, y = elem["x"], elem["y"]
-
-        self.cdp.send("Input.dispatchMouseEvent", {
-            "type": "mousePressed",
-            "x": x, "y": y,
-            "button": "left",
-            "clickCount": 1
-        })
-        self.cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseReleased",
-            "x": x, "y": y,
-            "button": "left",
-            "clickCount": 1
-        })
-
-    def click_js(self, selector: str):
-        """通过 JS click() 点击元素（更可靠，适合小图标等）"""
-        self.wait_for_selector(selector)
-        clicked = self._evaluate(f"""
-        (function() {{
-            const el = document.querySelector({json.dumps(selector)});
-            if (el) {{ el.click(); return true; }}
-            return false;
-        }})()
-        """)
-        if not clicked:
-            raise Exception(f"点击失败: {selector}")
+        if native:
+            self._scroll_into_view(selector)
+            elem = self.query_selector(selector)
+            assert elem is not None
+            offset_x, offset_y = self._get_viewport_offset()
+            x, y = elem["x"] + offset_x, elem["y"] + offset_y
+            self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
+            self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+        else:
+            clicked = self._evaluate(f"""
+            (function() {{
+                const el = document.querySelector({json.dumps(selector)});
+                if (el) {{ el.click(); return true; }}
+                return false;
+            }})()
+            """)
+            if not clicked:
+                raise Exception(f"点击失败: {selector}")
 
     def click_by_text(self, text: str, tag: str = "*", exact: bool = False, timeout: float = 10):
         """通过文本内容点击元素"""
@@ -285,42 +273,39 @@ class Frame:
             time.sleep(0.1)
         raise Exception(f"未找到文本: {text}")
 
-    def click_all(self, selector: str, delay: float = 0.3) -> int:
-        """点击所有匹配的元素，返回点击数量"""
-        elements = self.query_all(selector)
-        visible = [el for el in elements if el.get("visible")]
-        count = 0
-        for _ in visible:
-            try:
-                self._scroll_into_view(selector)
-                fresh = self.query_all(selector)
-                if count < len(fresh) and fresh[count].get("visible"):
-                    x, y = fresh[count]["x"], fresh[count]["y"]
-                    self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
-                    self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
-                    count += 1
-                    time.sleep(delay)
-            except Exception:
-                break
-        return count
+    def double_click(self, selector: str, native: bool = False):
+        """双击元素
 
-    def double_click(self, selector: str):
-        """双击元素"""
+        Args:
+            selector: CSS 选择器
+            native: 是否使用原生鼠标事件（默认 False 使用 JS）
+        """
         self.wait_for_selector(selector)
-        self._scroll_into_view(selector)
-        elem = self.query_selector(selector)
-        assert elem is not None
-        x, y = elem["x"], elem["y"]
-        self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})
-        self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})
+        if native:
+            self._scroll_into_view(selector)
+            elem = self.query_selector(selector)
+            assert elem is not None
+            offset_x, offset_y = self._get_viewport_offset()
+            x, y = elem["x"] + offset_x, elem["y"] + offset_y
+            self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})
+            self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})
+        else:
+            self._evaluate(f"""
+            (function() {{
+                const el = document.querySelector({json.dumps(selector)});
+                if (el) el.dispatchEvent(new MouseEvent('dblclick', {{ bubbles: true }}));
+            }})()
+            """)
 
     def hover(self, selector: str):
-        """悬停在元素上"""
+        """悬停在元素上（使用原生鼠标事件，因为 JS 无法触发 CSS :hover）"""
         self.wait_for_selector(selector)
         self._scroll_into_view(selector)
         elem = self.query_selector(selector)
         assert elem is not None
-        self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": elem["x"], "y": elem["y"]})
+        offset_x, offset_y = self._get_viewport_offset()
+        x, y = elem["x"] + offset_x, elem["y"] + offset_y
+        self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
 
     def fill(self, selector: str, value: str):
         """填充表单值"""
@@ -336,37 +321,47 @@ class Frame:
         """
         self._evaluate(js)
 
-    def select(self, selector: str, value: str):
-        """选择下拉框选项（通过 value）"""
-        self.wait_for_selector(selector)
-        js = f"""
-        (function(selector, value) {{
-            const el = document.querySelector(selector);
-            el.value = value;
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        }})({json.dumps(selector)}, {json.dumps(value)})
-        """
-        self._evaluate(js)
+    def select(self, selector: str, *, value: Optional[str] = None, text: Optional[str] = None):
+        """选择下拉框选项
 
-    def select_by_text(self, selector: str, text: str):
-        """通过选项文本选择下拉框"""
-        self.wait_for_selector(selector)
-        js = f"""
-        (function() {{
-            const sel = document.querySelector({json.dumps(selector)});
-            if (!sel) return false;
-            for (const opt of sel.options) {{
-                if (opt.text?.includes({json.dumps(text)})) {{
-                    sel.value = opt.value;
-                    sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return true;
-                }}
-            }}
-            return false;
-        }})()
+        Args:
+            selector: CSS 选择器
+            value: 通过 value 属性选择
+            text: 通过选项文本选择（模糊匹配）
+
+        注意：value 和 text 必须指定其一
         """
-        if not self._evaluate(js):
-            raise Exception(f"未找到选项: {text}")
+        if value is None and text is None:
+            raise ValueError("必须指定 value 或 text")
+
+        self.wait_for_selector(selector)
+
+        if value is not None:
+            js = f"""
+            (function() {{
+                const el = document.querySelector({json.dumps(selector)});
+                el.value = {json.dumps(value)};
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }})()
+            """
+            self._evaluate(js)
+        else:
+            js = f"""
+            (function() {{
+                const sel = document.querySelector({json.dumps(selector)});
+                if (!sel) return false;
+                for (const opt of sel.options) {{
+                    if (opt.text?.includes({json.dumps(text)})) {{
+                        sel.value = opt.value;
+                        sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        return true;
+                    }}
+                }}
+                return false;
+            }})()
+            """
+            if not self._evaluate(js):
+                raise Exception(f"未找到选项: {text}")
 
     def check(self, selector: str, checked: bool = True):
         """勾选/取消勾选复选框"""
@@ -396,26 +391,6 @@ class Frame:
     def get_attribute(self, selector: str, attr: str) -> str:
         """获取元素属性"""
         js = f"document.querySelector({json.dumps(selector)})?.getAttribute({json.dumps(attr)})"
-        return self._evaluate(js)
-
-    def get_options(self, selector: str) -> list[dict]:
-        """获取下拉框的所有选项"""
-        js = f"""
-        (function() {{
-            const sel = document.querySelector({json.dumps(selector)});
-            if (!sel) return [];
-            return Array.from(sel.options).map(o => ({{
-                value: o.value,
-                text: o.text,
-                selected: o.selected
-            }}));
-        }})()
-        """
-        return self._evaluate(js) or []
-
-    def get_selected_text(self, selector: str) -> str:
-        """获取下拉框当前选中的文本"""
-        js = f"document.querySelector({json.dumps(selector)})?.selectedOptions[0]?.text || ''"
         return self._evaluate(js)
 
     def is_checked(self, selector: str) -> bool:
@@ -449,7 +424,7 @@ class Frame:
             raise Exception(f"元素不是 iframe: {selector}")
 
         # 获取或创建 Frame 对象
-        child_frame = self._manager.get_or_create_frame(frame_id, parent=self)
+        child_frame = self._manager.get_or_create_frame(frame_id, parent=self, owner_selector=selector)
 
         # 等待 context 就绪
         child_frame._ensure_context(timeout)
@@ -625,10 +600,7 @@ class FrameManager:
             if target_info.get("type") == "iframe" and new_session_id:
                 self._pending_sessions[new_session_id] = target_info
                 # 在新 session 上启用 Runtime
-                try:
-                    self._cdp.send("Runtime.enable", session_id=new_session_id)
-                except Exception:
-                    pass
+                self._cdp.send("Runtime.enable", session_id=new_session_id)
 
         elif method == "Page.frameDetached":
             frame_id = params.get("frameId")
@@ -636,26 +608,29 @@ class FrameManager:
                 self._frames[frame_id]._on_detached()
 
         elif method == "Browser.downloadWillBegin":
+            frame_id = params.get("frameId")
             guid = params.get("guid")
-            if guid:
+            # 只处理属于当前 FrameManager 的下载（包括跨域 iframe）
+            if guid and frame_id in self._frames:
                 self._pending_downloads[guid] = params
 
         elif method == "Browser.downloadProgress":
             guid = params.get("guid")
             state = params.get("state")
-            if guid and state == "completed":
+            # 只处理已跟踪的下载（通过 downloadWillBegin 过滤过的）
+            if guid and guid in self._pending_downloads and state == "completed":
                 self._completed_downloads[guid] = params
                 self._pending_downloads.pop(guid, None)
 
         elif method == "Page.javascriptDialogOpening":
             self._pending_dialog = params
 
-    def get_or_create_frame(self, frame_id: str, parent: Optional[Frame] = None, target_id: Optional[str] = None) -> Frame:
+    def get_or_create_frame(self, frame_id: str, parent: Optional[Frame] = None, target_id: Optional[str] = None, owner_selector: Optional[str] = None) -> Frame:
         """获取或创建 Frame 对象"""
         if frame_id in self._frames:
             return self._frames[frame_id]
 
-        frame = Frame(self, frame_id, parent=parent, target_id=target_id)
+        frame = Frame(self, frame_id, parent=parent, target_id=target_id, owner_selector=owner_selector)
         self._frames[frame_id] = frame
 
         # 检查是否有缓存的 context 信息
@@ -692,10 +667,7 @@ class FrameManager:
 
         # 跨域 iframe session 也启用
         for session_id in self._pending_sessions:
-            try:
-                self._cdp.send("Browser.setDownloadBehavior", params, session_id=session_id)
-            except Exception:
-                pass
+            self._cdp.send("Browser.setDownloadBehavior", params, session_id=session_id)
 
     def _wait_for_download(self, timeout: float = 60) -> dict:
         """等待下载完成"""

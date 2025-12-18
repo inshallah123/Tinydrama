@@ -180,26 +180,32 @@ class Browser:
 
     def close(self):
         """关闭浏览器"""
+        errors = []
+
         if self._managers:
             try:
                 any_manager = next(iter(self._managers.values()))
                 any_manager._cdp.send("Browser.close")
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(f"Browser.close 失败: {e}")
 
             for manager in self._managers.values():
                 try:
                     manager._cdp.close()
-                except Exception:
-                    pass
+                except Exception as e:
+                    errors.append(f"CDPSession.close 失败: {e}")
             self._managers.clear()
 
         if self.process:
             try:
                 self.process.terminate()
                 self.process.wait(timeout=5)
-            except Exception:
+            except Exception as e:
+                errors.append(f"进程终止失败，尝试强制 kill: {e}")
                 self.process.kill()
+
+        if errors:
+            raise Exception("关闭浏览器时出错:\n" + "\n".join(errors))
 
 
 # 兼容性别名
