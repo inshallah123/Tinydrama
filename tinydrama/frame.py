@@ -13,8 +13,12 @@ from .cdp import CDPSession
 
 class Frame:
     """Frame - 统一表示主页面和 iframe
-    每个 Frame 绑定一个 frame_id（固定），context_id 和 session_id 动态更新。
-    通过 parent 属性区分根 frame（Tab）和子 frame（iframe）。
+
+    - frame_id: 固定标识
+    - session_id: 跨域 iframe 有独立值，同源 iframe 为 None
+    - context_id: 仅同源 iframe 需要（用于区分和主页面的执行环境）
+
+    根 frame 和跨域 iframe 不指定 contextId，让浏览器自动使用默认 context。
     """
 
     def __init__(self, manager: 'FrameManager', frame_id: str, parent: Optional['Frame'] = None, target_id: Optional[str] = None, owner_selector: Optional[str] = None):
@@ -23,8 +27,7 @@ class Frame:
         self._parent = parent
         self._target_id = target_id  # 只有根 frame 有
         self._owner_selector = owner_selector  # iframe 在父 frame 中的 selector
-        # 动态状态 - 由 Frame
-        # Manager 通过事件更新
+        # 动态状态 - 由 FrameManager 通过事件更新
         self._context_id: Optional[int] = None
         self._session_id: Optional[str] = None  # 跨域 iframe 才有
         self._detached: bool = False  # frame 是否已被移除
@@ -51,11 +54,23 @@ class Frame:
         self._context_id = None
         self._detached = True
 
-    def _ensure_context(self, timeout: float = 10.0):
-        """确保 context 已就绪"""
+    def _ensure_not_detached(self):
+        """确保 frame 未被移除"""
         if self._detached:
             hint = f"selector={self._owner_selector}" if self._owner_selector else f"frame_id={self._frame_id}"
             raise Exception(f"Frame 已被移除，请重新获取: {hint}")
+
+    def _needs_context_id(self) -> bool:
+        """是否需要指定 contextId（同源 iframe 需要，根 frame 和跨域 iframe 不需要）"""
+        # 根 frame：不需要，使用页面默认 context
+        # 跨域 iframe：有独立 session，不需要，使用该 session 默认 context
+        # 同源 iframe：共享主页面 session，需要 contextId 来区分
+        return not self.is_root and self._session_id is None
+
+    def _ensure_context(self, timeout: float = 10.0):
+        """确保 context 已就绪（仅同源 iframe 需要）"""
+        if not self._needs_context_id():
+            return
 
         if self._context_id is not None:
             return
@@ -95,34 +110,24 @@ class Frame:
     # ==================== JavaScript 执行 ====================
 
     def _evaluate(self, expression: str, return_by_value: bool = True) -> Any:
-        """执行 JavaScript 表达式"""
-        self._manager._cdp.poll_events(timeout=0)
-        self._manager._flush_pending_enables()
-        self._ensure_context()
+        """执行 JavaScript 表达式
+
+        - 根 frame / 跨域 iframe：不指定 contextId，让浏览器使用默认 context
+        - 同源 iframe：需要指定 contextId 来区分和主页面
+        """
+        self._ensure_not_detached()
 
         params = {
             "expression": expression,
             "returnByValue": return_by_value,
         }
-        if self._context_id is not None:
-            params["contextId"] = self._context_id
-
-        try:
-            result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
-        except Exception as e:
-            if "Cannot find context" in str(e):
-                # context 失效，重新启用 Runtime 以获取新 context
-                self._context_id = None
-                if self._session_id:
-                    try:
-                        self.cdp.send("Runtime.enable", session_id=self._session_id)
-                    except Exception:
-                        pass
-                self._ensure_context()
+        # 同源 iframe 需要指定 contextId
+        if self._needs_context_id():
+            self._ensure_context()
+            if self._context_id is not None:
                 params["contextId"] = self._context_id
-                result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
-            else:
-                raise
+
+        result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
 
         if "exceptionDetails" in result:
             raise Exception(f"JS执行错误: {result['exceptionDetails']}")
@@ -597,6 +602,7 @@ class FrameManager:
         handlers = {
             "Runtime.executionContextCreated": self._on_context_created,
             "Runtime.executionContextDestroyed": self._on_context_destroyed,
+            "Runtime.executionContextsCleared": self._on_contexts_cleared,
             "Target.attachedToTarget": self._on_target_attached,
             "Page.frameDetached": self._on_frame_detached,
             "Page.javascriptDialogOpening": self._on_dialog_opening,
@@ -636,6 +642,11 @@ class FrameManager:
             if frame._context_id == ctx_id:
                 frame._context_id = None
                 break
+
+    def _on_contexts_cleared(self, event: dict):
+        """处理所有 JS 上下文被清除（导航时触发）"""
+        for frame in self._frames.values():
+            frame._context_id = None
 
     def _on_target_attached(self, event: dict):
         """处理跨域 iframe 附加"""

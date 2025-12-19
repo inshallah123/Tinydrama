@@ -34,7 +34,6 @@ __all__ = [
     "Browser",
     "Frame",
     # 兼容性
-    "MiniBrowser",
     # 高级用法
     "FrameManager",
     "CDPSession",
