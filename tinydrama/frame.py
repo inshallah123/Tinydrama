@@ -602,7 +602,6 @@ class FrameManager:
         handlers = {
             "Runtime.executionContextCreated": self._on_context_created,
             "Runtime.executionContextDestroyed": self._on_context_destroyed,
-            "Runtime.executionContextsCleared": self._on_contexts_cleared,
             "Target.attachedToTarget": self._on_target_attached,
             "Page.frameDetached": self._on_frame_detached,
             "Page.javascriptDialogOpening": self._on_dialog_opening,
@@ -642,11 +641,6 @@ class FrameManager:
             if frame._context_id == ctx_id:
                 frame._context_id = None
                 break
-
-    def _on_contexts_cleared(self, event: dict):
-        """处理所有 JS 上下文被清除（导航时触发）"""
-        for frame in self._frames.values():
-            frame._context_id = None
 
     def _on_target_attached(self, event: dict):
         """处理跨域 iframe 附加"""
