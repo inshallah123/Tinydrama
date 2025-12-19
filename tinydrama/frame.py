@@ -13,7 +13,6 @@ from .cdp import CDPSession
 
 class Frame:
     """Frame - 统一表示主页面和 iframe
-
     每个 Frame 绑定一个 frame_id（固定），context_id 和 session_id 动态更新。
     通过 parent 属性区分根 frame（Tab）和子 frame（iframe）。
     """
@@ -24,10 +23,11 @@ class Frame:
         self._parent = parent
         self._target_id = target_id  # 只有根 frame 有
         self._owner_selector = owner_selector  # iframe 在父 frame 中的 selector
-
-        # 动态状态 - 由 FrameManager 通过事件更新
+        # 动态状态 - 由 Frame
+        # Manager 通过事件更新
         self._context_id: Optional[int] = None
         self._session_id: Optional[str] = None  # 跨域 iframe 才有
+        self._detached: bool = False  # frame 是否已被移除
 
     @property
     def is_root(self) -> bool:
@@ -49,15 +49,21 @@ class Frame:
     def _on_detached(self):
         """frame 被移除（由 FrameManager 调用）"""
         self._context_id = None
+        self._detached = True
 
-    def _ensure_context(self, timeout: float = 5.0):
+    def _ensure_context(self, timeout: float = 10.0):
         """确保 context 已就绪"""
+        if self._detached:
+            hint = f"selector={self._owner_selector}" if self._owner_selector else f"frame_id={self._frame_id}"
+            raise Exception(f"Frame 已被移除，请重新获取: {hint}")
+
         if self._context_id is not None:
             return
 
         start = time.time()
         while time.time() - start < timeout:
             self._manager._cdp.poll_events(timeout=0.1)
+            self._manager._flush_pending_enables()
             if self._context_id is not None:
                 return
 
@@ -91,6 +97,7 @@ class Frame:
     def _evaluate(self, expression: str, return_by_value: bool = True) -> Any:
         """执行 JavaScript 表达式"""
         self._manager._cdp.poll_events(timeout=0)
+        self._manager._flush_pending_enables()
         self._ensure_context()
 
         params = {
@@ -104,8 +111,13 @@ class Frame:
             result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
         except Exception as e:
             if "Cannot find context" in str(e):
-                # context 失效，等待新 context
+                # context 失效，重新启用 Runtime 以获取新 context
                 self._context_id = None
+                if self._session_id:
+                    try:
+                        self.cdp.send("Runtime.enable", session_id=self._session_id)
+                    except Exception:
+                        pass
                 self._ensure_context()
                 params["contextId"] = self._context_id
                 result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
@@ -119,12 +131,6 @@ class Frame:
         if return_by_value:
             return value.get("value")
         return value
-
-    def _call_function(self, func: str, *args) -> Any:
-        """调用 JavaScript 函数"""
-        args_json = json.dumps(args)
-        expression = f"({func}).apply(null, {args_json})"
-        return self._evaluate(expression)
 
     # ==================== 页面导航 ====================
 
@@ -151,9 +157,9 @@ class Frame:
 
     def query_selector(self, selector: str) -> Optional[dict]:
         """查询元素，返回元素信息"""
-        js = """
-        function(selector) {
-            const el = document.querySelector(selector);
+        js = f"""
+        (function() {{
+            const el = document.querySelector({json.dumps(selector)});
             if (!el) return null;
             const rect = el.getBoundingClientRect();
             const style = window.getComputedStyle(el);
@@ -162,7 +168,7 @@ class Frame:
             const isVisible = style.display !== 'none' &&
                               style.visibility !== 'hidden' &&
                               (computedWidth > 0 || rect.width > 0);
-            return {
+            return {{
                 tagName: el.tagName,
                 id: el.id,
                 className: el.className,
@@ -171,10 +177,10 @@ class Frame:
                 width: rect.width || computedWidth,
                 height: rect.height || computedHeight,
                 visible: isVisible
-            };
-        }
+            }};
+        }})()
         """
-        return self._call_function(js, selector)
+        return self._evaluate(js)
 
     def wait_for_selector(self, selector: str, timeout: float = 10) -> dict:
         """等待元素出现"""
@@ -255,21 +261,26 @@ class Frame:
 
         js = f"""
         (function() {{
+            const matches = [];
             for (const el of document.querySelectorAll('{tag}')) {{
                 if ({condition} && el.offsetParent !== null) {{
-                    el.setAttribute('data-td-tmp', '1');
-                    return true;
+                    matches.push(el);
                 }}
             }}
-            return false;
+            if (matches.length === 1) {{
+                matches[0].setAttribute('data-td-tmp', '1');
+            }}
+            return matches.length;
         }})()
         """
         start = time.time()
         while time.time() - start < timeout:
-            if self._evaluate(js):
+            count = self._evaluate(js)
+            if count == 1:
                 self.click("[data-td-tmp='1']")
-                self._evaluate("document.querySelector('[data-td-tmp]')?.removeAttribute('data-td-tmp')")
                 return
+            elif count > 1:
+                raise Exception(f"文本 '{text}' 匹配到 {count} 个元素，请使用更精确的选择器")
             time.sleep(0.1)
         raise Exception(f"未找到文本: {text}")
 
@@ -328,7 +339,6 @@ class Frame:
             selector: CSS 选择器
             value: 通过 value 属性选择
             text: 通过选项文本选择（模糊匹配）
-
         注意：value 和 text 必须指定其一
         """
         if value is None and text is None:
@@ -424,7 +434,7 @@ class Frame:
             raise Exception(f"元素不是 iframe: {selector}")
 
         # 获取或创建 Frame 对象
-        child_frame = self._manager.get_or_create_frame(frame_id, parent=self, owner_selector=selector)
+        child_frame = self._manager._ensure_frame(frame_id, parent=self, owner_selector=selector)
 
         # 等待 context 就绪
         child_frame._ensure_context(timeout)
@@ -501,20 +511,6 @@ class Frame:
             raise Exception("只有根 frame 可以 activate")
         self.cdp.send("Target.activateTarget", {"targetId": self._target_id})
 
-    # ==================== 下载功能 ====================
-
-    def enable_download(self, download_path: str):
-        """启用下载并指定保存目录"""
-        self._manager._enable_download(download_path)
-
-    def wait_for_download(self, timeout: float = 60) -> dict:
-        """等待下载完成
-
-        Returns:
-            下载完成信息，包含 guid, totalBytes, receivedBytes, state 等
-        """
-        return self._manager._wait_for_download(timeout)
-
     # ==================== 弹窗功能 ====================
 
     def handle_dialog(self, accept: bool = True, prompt_text: str = ""):
@@ -533,27 +529,20 @@ class Frame:
 class FrameManager:
     """Frame 管理器 - 集中管理事件监听和 Frame 对象"""
 
+    # ==================== 初始化 ====================
+
     def __init__(self, cdp: CDPSession, target_id: str):
         self._cdp = cdp
-        self._target_id = target_id
+        self._target_id = target_id # 调试对象，TAB/跨域 iframe
         self._frames: dict[str, Frame] = {}  # frame_id -> Frame
         self._pending_sessions: dict[str, dict] = {}  # session_id -> target_info
+        self._sessions_to_enable: list[str] = []  # 待启用 Runtime 的 session
         self._pending_contexts: dict[str, tuple[int, Optional[str]]] = {}  # frame_id -> (context_id, session_id)
-
-        # 下载和弹窗状态
-        self._pending_downloads: dict[str, dict] = {}
-        self._completed_downloads: dict[str, dict] = {}
         self._pending_dialog: Optional[dict] = None
-
-        # 注册事件监听
-        cdp.on_event(self._on_event)
-
-        # 启用必要的 CDP 域
+        cdp.on_event(self._handle_event)
         cdp.send("Page.enable")
         cdp.send("Runtime.enable")
         cdp.send("DOM.enable")
-
-        # 启用跨域 iframe 自动附加
         cdp.send("Target.setAutoAttach", {
             "autoAttach": True,
             "waitForDebuggerOnStart": False,
@@ -561,139 +550,117 @@ class FrameManager:
             "filter": [{"type": "iframe", "exclude": False}]
         })
 
-    def _on_event(self, event: dict):
-        """处理 CDP 事件"""
-        method = event.get("method")
-        params = event.get("params", {})
-        session_id = event.get("sessionId")  # 事件来源的 session
+    def get_main_frame(self) -> Frame:
+        """获取主 frame"""
+        result = self._cdp.send("Page.getFrameTree")
+        main_frame = result.get("frameTree", {}).get("frame", {})
+        if not main_frame.get("id"):
+            raise Exception("无法获取主 frame")
+        return self._ensure_frame(main_frame["id"], target_id=self._target_id)
 
-        if method == "Runtime.executionContextCreated":
-            ctx = params["context"]
-            aux_data = ctx.get("auxData", {})
-            frame_id = aux_data.get("frameId")
-            context_id = ctx["id"]
-            is_default = aux_data.get("isDefault", False)
-
-            if frame_id:
-                frame = self._frames.get(frame_id)
-                if frame:
-                    # 只更新 default context，或者 frame 还没有 context
-                    if is_default or frame._context_id is None:
-                        frame._set_context(context_id, session_id)
-                else:
-                    # Frame 对象还没创建，先缓存 context 信息
-                    if is_default or frame_id not in self._pending_contexts:
-                        self._pending_contexts[frame_id] = (context_id, session_id)
-
-        elif method == "Runtime.executionContextDestroyed":
-            ctx_id = params.get("executionContextId")
-            for frame in self._frames.values():
-                if frame._context_id == ctx_id:
-                    frame._context_id = None
-                    break
-
-        elif method == "Target.attachedToTarget":
-            # 跨域 iframe 被附加
-            new_session_id = params.get("sessionId")
-            target_info = params.get("targetInfo", {})
-
-            if target_info.get("type") == "iframe" and new_session_id:
-                self._pending_sessions[new_session_id] = target_info
-                # 在新 session 上启用 Runtime
-                self._cdp.send("Runtime.enable", session_id=new_session_id)
-
-        elif method == "Page.frameDetached":
-            frame_id = params.get("frameId")
-            if frame_id in self._frames:
-                self._frames[frame_id]._on_detached()
-
-        elif method == "Browser.downloadWillBegin":
-            frame_id = params.get("frameId")
-            guid = params.get("guid")
-            # 只处理属于当前 FrameManager 的下载（包括跨域 iframe）
-            if guid and frame_id in self._frames:
-                self._pending_downloads[guid] = params
-
-        elif method == "Browser.downloadProgress":
-            guid = params.get("guid")
-            state = params.get("state")
-            # 只处理已跟踪的下载（通过 downloadWillBegin 过滤过的）
-            if guid and guid in self._pending_downloads and state == "completed":
-                self._completed_downloads[guid] = params
-                self._pending_downloads.pop(guid, None)
-
-        elif method == "Page.javascriptDialogOpening":
-            self._pending_dialog = params
-
-    def get_or_create_frame(self, frame_id: str, parent: Optional[Frame] = None, target_id: Optional[str] = None, owner_selector: Optional[str] = None) -> Frame:
-        """获取或创建 Frame 对象"""
+    def _ensure_frame(self, frame_id: str, parent: Optional[Frame] = None,
+                      target_id: Optional[str] = None, owner_selector: Optional[str] = None) -> Frame:
+        """获取或创建指向 frame 的代理对象"""
         if frame_id in self._frames:
-            return self._frames[frame_id]
+            existing = self._frames[frame_id]
+            if not existing._detached:
+                return existing
+            # 已 detached 的 frame，移除并重新创建
+            del self._frames[frame_id]
 
         frame = Frame(self, frame_id, parent=parent, target_id=target_id, owner_selector=owner_selector)
         self._frames[frame_id] = frame
 
-        # 检查是否有缓存的 context 信息
         if frame_id in self._pending_contexts:
             context_id, session_id = self._pending_contexts.pop(frame_id)
             frame._set_context(context_id, session_id)
 
-        # 尝试获取已有的 context（可能事件已经到达）
-        self._cdp.poll_events(timeout=0)
-
         return frame
 
-    def get_main_frame(self) -> Frame:
-        """获取主 frame"""
-        result = self._cdp.send("Page.getFrameTree")
-        frame_tree = result.get("frameTree", {})
-        main_frame_id = frame_tree.get("frame", {}).get("id")
+    def _flush_pending_enables(self):
+        """处理待启用的 session（延迟执行，避免嵌套调用）"""
+        while self._sessions_to_enable:
+            session_id = self._sessions_to_enable.pop(0)
+            try:
+                self._cdp.send("Runtime.enable", session_id=session_id)
+            except Exception as e:
+                # 只忽略 session 失效的错误（跨域 iframe 可能已被移除）
+                if "session" not in str(e).lower() and "target" not in str(e).lower():
+                    raise
 
-        if not main_frame_id:
-            raise Exception("无法获取主 frame")
+    def _handle_event(self, event: dict):
+        """事件分发"""
+        method = event.get("method")
+        if not method:
+            return
 
-        return self.get_or_create_frame(main_frame_id, target_id=self._target_id)
-
-    # ==================== 下载功能（内部方法）====================
-
-    def _enable_download(self, download_path: str):
-        """启用下载并指定保存目录"""
-        params = {
-            "behavior": "allow",
-            "downloadPath": download_path,
-            "eventsEnabled": True
+        handlers = {
+            "Runtime.executionContextCreated": self._on_context_created,
+            "Runtime.executionContextDestroyed": self._on_context_destroyed,
+            "Target.attachedToTarget": self._on_target_attached,
+            "Page.frameDetached": self._on_frame_detached,
+            "Page.javascriptDialogOpening": self._on_dialog_opening,
         }
-        self._cdp.send("Browser.setDownloadBehavior", params)
+        handler = handlers.get(method)
+        if handler:
+            handler(event)
 
-        # 跨域 iframe session 也启用
-        for session_id in self._pending_sessions:
-            self._cdp.send("Browser.setDownloadBehavior", params, session_id=session_id)
+    # ==================== 事件处理器 ====================
 
-    def _wait_for_download(self, timeout: float = 60) -> dict:
-        """等待下载完成"""
-        guid = None
-        start = time.time()
+    def _on_context_created(self, event: dict):
+        """处理 JS 上下文创建"""
+        params = event.get("params", {})
+        session_id = event.get("sessionId")
+        ctx = params["context"]
+        aux_data = ctx.get("auxData", {})
+        frame_id = aux_data.get("frameId")
+        context_id = ctx["id"]
+        is_default = aux_data.get("isDefault", False)
 
-        while time.time() - start < timeout:
-            self._cdp.poll_events()
-            if self._pending_downloads:
-                guid, _ = self._pending_downloads.popitem()
+        if not frame_id:
+            return
+
+        frame = self._frames.get(frame_id)
+        if frame:
+            if is_default or frame._context_id is None:
+                frame._set_context(context_id, session_id)
+        else:
+            if is_default or frame_id not in self._pending_contexts:
+                self._pending_contexts[frame_id] = (context_id, session_id)
+
+    def _on_context_destroyed(self, event: dict):
+        """处理 JS 上下文销毁"""
+        params = event.get("params", {})
+        ctx_id = params.get("executionContextId")
+        for frame in self._frames.values():
+            if frame._context_id == ctx_id:
+                frame._context_id = None
                 break
-            time.sleep(0.1)
 
-        if not guid:
-            raise TimeoutError("未检测到下载开始")
+    def _on_target_attached(self, event: dict):
+        """处理跨域 iframe 附加"""
+        params = event.get("params", {})
+        new_session_id = params.get("sessionId")
+        target_info = params.get("targetInfo", {})
 
-        while time.time() - start < timeout:
-            self._cdp.poll_events()
-            if guid in self._completed_downloads:
-                result = self._completed_downloads.pop(guid)
-                return result
-            time.sleep(0.1)
+        if target_info.get("type") == "iframe" and new_session_id:
+            self._pending_sessions[new_session_id] = target_info
+            # 延迟启用，避免在事件处理器中嵌套调用 send
+            self._sessions_to_enable.append(new_session_id)
 
-        raise TimeoutError("下载超时")
+    def _on_frame_detached(self, event: dict):
+        """处理 frame 移除"""
+        params = event.get("params", {})
+        frame_id = params.get("frameId")
+        if frame_id in self._frames:
+            self._frames[frame_id]._on_detached()
 
-    # ==================== 弹窗功能（内部方法）====================
+    def _on_dialog_opening(self, event: dict):
+        """处理弹窗出现"""
+        params = event.get("params", {})
+        self._pending_dialog = params
+
+    # ==================== 弹窗 ====================
 
     def _handle_dialog(self, accept: bool = True, prompt_text: str = ""):
         """处理弹窗"""

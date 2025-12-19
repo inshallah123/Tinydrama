@@ -25,7 +25,7 @@ iframe 操作:
     child.click("button")
 """
 
-from .browser import Browser, MiniBrowser
+from .browser import Browser
 from .frame import Frame, FrameManager
 from .cdp import CDPSession, WebSocketClient
 

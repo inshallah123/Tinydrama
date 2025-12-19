@@ -23,6 +23,9 @@ class Browser:
         self.timeout = timeout
         self.process: Optional[subprocess.Popen] = None
         self._managers: dict[str, FrameManager] = {}  # target_id -> FrameManager
+        self._browser_cdp: Optional[CDPSession] = None  # browser-level 连接
+        self._pending_downloads: dict[str, dict] = {}  # guid -> event params
+        self._completed_downloads: dict[str, dict] = {}  # guid -> event params
 
     def __enter__(self):
         return self
@@ -68,14 +71,12 @@ class Browser:
         ]
         self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        last_error = None
-        for _ in range(50):
+        for _ in range(10):
             try:
                 return self._connect_first_tab()
-            except Exception as e:
-                last_error = e
-                time.sleep(0.2)
-        raise Exception(f"浏览器启动超时: {last_error}")
+            except Exception:
+                time.sleep(0.3)
+        raise Exception("浏览器连接超时")
 
     def _find_browser(self, browser_type: str = "auto") -> str:
         """查找浏览器路径"""
@@ -112,6 +113,39 @@ class Browser:
         targets = json.loads(response.read().decode())
         conn.close()
         return targets
+
+    def _get_browser_ws_url(self) -> str:
+        """获取 browser-level WebSocket URL"""
+        conn = http.client.HTTPConnection("127.0.0.1", self.debug_port)
+        conn.request("GET", "/json/version")
+        response = conn.getresponse()
+        info = json.loads(response.read().decode())
+        conn.close()
+        return info["webSocketDebuggerUrl"]
+
+    def _connect_browser_cdp(self):
+        """建立 browser-level CDP 连接"""
+        if self._browser_cdp:
+            return
+        ws_url = self._get_browser_ws_url()
+        self._browser_cdp = CDPSession(ws_url, self.timeout)
+        self._browser_cdp.on_event(self._handle_browser_event)
+
+    def _handle_browser_event(self, event: dict):
+        """处理 browser-level 事件"""
+        method = event.get("method")
+        params = event.get("params", {})
+
+        if method == "Browser.downloadWillBegin":
+            guid = params.get("guid")
+            if guid:
+                self._pending_downloads[guid] = params
+        elif method == "Browser.downloadProgress":
+            guid = params.get("guid")
+            state = params.get("state")
+            if guid and state == "completed":
+                self._completed_downloads[guid] = params
+                self._pending_downloads.pop(guid, None)
 
     def _connect_first_tab(self) -> Frame:
         """连接到第一个可用的标签页"""
@@ -178,23 +212,73 @@ class Browser:
         manager._cdp.close()
         self._managers.pop(frame._target_id, None)
 
+    # ==================== 下载功能 ====================
+
+    def enable_download(self, download_path: str):
+        """启用下载并指定保存目录"""
+        self._connect_browser_cdp()
+        assert self._browser_cdp is not None
+        self._browser_cdp.send("Browser.setDownloadBehavior", {
+            "behavior": "allow",
+            "downloadPath": download_path,
+            "eventsEnabled": True
+        })
+
+    def wait_for_download(self, timeout: float = 60) -> dict:
+        """等待下载完成
+
+        Returns:
+            下载完成信息，包含 guid, totalBytes, receivedBytes, state 等
+        """
+        if not self._browser_cdp:
+            raise Exception("请先调用 enable_download")
+
+        guid = None
+        start = time.time()
+
+        # 等待下载开始
+        while time.time() - start < timeout:
+            self._browser_cdp.poll_events()
+            if self._pending_downloads:
+                guid = next(iter(self._pending_downloads.keys()))
+                break
+            time.sleep(0.1)
+
+        if not guid:
+            raise TimeoutError("未检测到下载开始")
+
+        # 等待下载完成
+        while time.time() - start < timeout:
+            self._browser_cdp.poll_events()
+            if guid in self._completed_downloads:
+                return self._completed_downloads.pop(guid)
+            time.sleep(0.1)
+
+        raise TimeoutError("下载超时")
+
     def close(self):
         """关闭浏览器"""
         errors = []
 
-        if self._managers:
+        # 关闭 browser-level 连接
+        if self._browser_cdp:
             try:
-                any_manager = next(iter(self._managers.values()))
-                any_manager._cdp.send("Browser.close")
+                self._browser_cdp.send("Browser.close")
             except Exception as e:
                 errors.append(f"Browser.close 失败: {e}")
+            try:
+                self._browser_cdp.close()
+            except Exception:
+                pass
+            self._browser_cdp = None
 
-            for manager in self._managers.values():
-                try:
-                    manager._cdp.close()
-                except Exception as e:
-                    errors.append(f"CDPSession.close 失败: {e}")
-            self._managers.clear()
+        # 关闭所有 target 连接
+        for manager in self._managers.values():
+            try:
+                manager._cdp.close()
+            except Exception as e:
+                errors.append(f"CDPSession.close 失败: {e}")
+        self._managers.clear()
 
         if self.process:
             try:
@@ -206,7 +290,3 @@ class Browser:
 
         if errors:
             raise Exception("关闭浏览器时出错:\n" + "\n".join(errors))
-
-
-# 兼容性别名
-MiniBrowser = Browser
