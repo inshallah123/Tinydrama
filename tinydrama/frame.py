@@ -56,6 +56,7 @@ class Frame:
 
     def _ensure_not_detached(self):
         """确保 frame 未被移除"""
+        self._manager._cdp.poll_events(timeout=0)  # 先处理待处理事件
         if self._detached:
             hint = f"selector={self._owner_selector}" if self._owner_selector else f"frame_id={self._frame_id}"
             raise Exception(f"Frame 已被移除，请重新获取: {hint}")
@@ -124,10 +125,20 @@ class Frame:
         # 同源 iframe 需要指定 contextId
         if self._needs_context_id():
             self._ensure_context()
-            if self._context_id is not None:
-                params["contextId"] = self._context_id
+            params["contextId"] = self._context_id
 
-        result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
+        try:
+            result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
+        except Exception as e:
+            # Context 失效时自动恢复：重新等待新 context 并重试一次
+            err_msg = str(e)
+            if "Cannot find context" in err_msg or "context was destroyed" in err_msg:
+                self._context_id = None
+                self._ensure_context()
+                params["contextId"] = self._context_id
+                result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
+            else:
+                raise
 
         if "exceptionDetails" in result:
             raise Exception(f"JS执行错误: {result['exceptionDetails']}")

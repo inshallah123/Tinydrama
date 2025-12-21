@@ -57,6 +57,20 @@ class Browser:
         process_name = "msedge.exe" if "edge" in browser_path.lower() else "chrome.exe"
 
         if kill_existing:
+            # 清理旧连接
+            for manager in self._managers.values():
+                try:
+                    manager._cdp.close()
+                except Exception:
+                    pass
+            self._managers.clear()
+            if self._browser_cdp:
+                try:
+                    self._browser_cdp.close()
+                except Exception:
+                    pass
+                self._browser_cdp = None
+
             os.system(f"taskkill /f /im {process_name} 2>nul")
             for _ in range(10):
                 result = subprocess.run("tasklist", capture_output=True, text=True, shell=True)

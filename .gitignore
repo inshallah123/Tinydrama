@@ -19,4 +19,4 @@ env/
 *.pdf
 .claude/
 auto_download.py
-
+test.py
