@@ -9,7 +9,13 @@ import time
 import http.client
 import json
 import os
+import shutil
+import sys
 from typing import Optional
+
+# Windows 注册表模块（仅 Windows 可用）
+if sys.platform == "win32":
+    import winreg
 
 from .cdp import CDPSession
 from .frame import Frame, FrameManager
@@ -93,27 +99,68 @@ class Browser:
         raise Exception("浏览器连接超时")
 
     def _find_browser(self, browser_type: str = "auto") -> str:
-        """查找浏览器路径"""
-        chrome_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        ]
-        edge_paths = [
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        ]
+        """查找浏览器路径
 
+        查找顺序：
+        1. shutil.which() - PATH 环境变量
+        2. Windows 注册表 - App Paths
+        3. 硬编码常见路径 - 备选
+        """
+        browsers = []
         if browser_type == "chrome":
-            paths = chrome_paths
+            browsers = [("chrome", "chrome.exe")]
         elif browser_type == "edge":
-            paths = edge_paths
-        else:
-            paths = chrome_paths + edge_paths
+            browsers = [("msedge", "msedge.exe")]
+        else:  # auto: Chrome 优先
+            browsers = [("chrome", "chrome.exe"), ("msedge", "msedge.exe")]
 
-        for p in paths:
-            if os.path.exists(p):
-                return p
+        for cmd, exe in browsers:
+            # 1. PATH 环境变量
+            path = shutil.which(cmd)
+            if path:
+                return path
+
+            # 2. Windows 注册表
+            if sys.platform == "win32":
+                path = self._find_in_registry(exe)
+                if path:
+                    return path
+
+            # 3. 硬编码常见路径（备选）
+            path = self._find_in_common_paths(exe)
+            if path:
+                return path
+
         raise Exception(f"未找到浏览器: {browser_type}")
+
+    def _find_in_registry(self, exe_name: str) -> Optional[str]:
+        """从 Windows 注册表查找浏览器路径"""
+        try:
+            key_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                path, _ = winreg.QueryValueEx(key, "")
+                if os.path.exists(path):
+                    return path
+        except (FileNotFoundError, OSError):
+            pass
+        return None
+
+    def _find_in_common_paths(self, exe_name: str) -> Optional[str]:
+        """从常见安装路径查找浏览器"""
+        common_paths = {
+            "chrome.exe": [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            ],
+            "msedge.exe": [
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            ],
+        }
+        for path in common_paths.get(exe_name, []):
+            if os.path.exists(path):
+                return path
+        return None
 
     def connect(self) -> Frame:
         """连接到已运行的浏览器，返回主 Frame"""
@@ -207,15 +254,6 @@ class Browser:
 
         raise Exception("无法连接到新标签页")
 
-    def get_frames(self) -> list[Frame]:
-        """获取所有根 Frame（即所有 Tab）"""
-        frames = []
-        for manager in self._managers.values():
-            for frame in manager._frames.values():
-                if frame.is_root:
-                    frames.append(frame)
-        return frames
-
     def close_tab(self, frame: Frame):
         """关闭指定标签页"""
         if not frame._target_id:
@@ -238,23 +276,38 @@ class Browser:
             "eventsEnabled": True
         })
 
-    def wait_for_download(self, timeout: float = 60) -> dict:
+    def wait_for_download(self, frame: Optional[Frame] = None, timeout: float = 60) -> dict:
         """等待下载完成
 
+        Args:
+            frame: 可选，指定等待哪个 frame 触发的下载（与 CDP frameId 一致）
+            timeout: 超时时间（秒）
+
         Returns:
-            下载完成信息，包含 guid, totalBytes, receivedBytes, state 等
+            下载完成信息，包含 guid, totalBytes, receivedBytes, state, frameId 等
         """
         if not self._browser_cdp:
             raise Exception("请先调用 enable_download")
 
+        target_frame_id = frame._frame_id if frame else None
         guid = None
         start = time.time()
+
+        def is_match(params: dict) -> bool:
+            """检查下载是否来自指定 frame"""
+            if target_frame_id is None:
+                return True
+            return params.get("frameId") == target_frame_id
 
         # 等待下载开始
         while time.time() - start < timeout:
             self._browser_cdp.poll_events()
-            if self._pending_downloads:
-                guid = next(iter(self._pending_downloads.keys()))
+            # 查找匹配的下载
+            for g, params in self._pending_downloads.items():
+                if is_match(params):
+                    guid = g
+                    break
+            if guid:
                 break
             time.sleep(0.1)
 
@@ -265,7 +318,10 @@ class Browser:
         while time.time() - start < timeout:
             self._browser_cdp.poll_events()
             if guid in self._completed_downloads:
-                return self._completed_downloads.pop(guid)
+                result = self._completed_downloads.pop(guid)
+                # 合并开始事件的信息（包含 url, suggestedFilename 等）
+                begin_info = self._pending_downloads.pop(guid, {})
+                return {**begin_info, **result}
             time.sleep(0.1)
 
         raise TimeoutError("下载超时")

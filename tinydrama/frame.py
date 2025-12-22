@@ -8,7 +8,7 @@ import json
 import time
 import base64
 from typing import Optional, Any
-from .cdp import CDPSession
+from .cdp import CDPSession, CDPError
 
 
 class Frame:
@@ -30,7 +30,6 @@ class Frame:
         # 动态状态 - 由 FrameManager 通过事件更新
         self._context_id: Optional[int] = None
         self._session_id: Optional[str] = None  # 跨域 iframe 才有
-        self._detached: bool = False  # frame 是否已被移除
 
     @property
     def is_root(self) -> bool:
@@ -44,22 +43,12 @@ class Frame:
     # ==================== 内部方法（由 FrameManager 调用）====================
 
     def _set_context(self, context_id: int, session_id: Optional[str] = None):
-        """设置执行上下文（由 FrameManager 调用）"""
+        """设置执行上下文（由 FrameManager 调用）
+        注意：session_id 始终更新，因为 iframe 导航可能导致跨域状态变化
+        （同源 → 跨域 或 跨域 → 同源）
+        """
         self._context_id = context_id
-        if session_id:
-            self._session_id = session_id
-
-    def _on_detached(self):
-        """frame 被移除（由 FrameManager 调用）"""
-        self._context_id = None
-        self._detached = True
-
-    def _ensure_not_detached(self):
-        """确保 frame 未被移除"""
-        self._manager._cdp.poll_events(timeout=0)  # 先处理待处理事件
-        if self._detached:
-            hint = f"selector={self._owner_selector}" if self._owner_selector else f"frame_id={self._frame_id}"
-            raise Exception(f"Frame 已被移除，请重新获取: {hint}")
+        self._session_id = session_id
 
     def _needs_context_id(self) -> bool:
         """是否需要指定 contextId（同源 iframe 需要，根 frame 和跨域 iframe 不需要）"""
@@ -84,6 +73,27 @@ class Frame:
                 return
 
         raise Exception(f"Frame context 未就绪: {self._frame_id}")
+
+    def _refresh_state(self, timeout: float = 5.0):
+        """刷新 frame 状态（处理 iframe 导航后的 context/session 变化）
+        当 iframe 内部导航导致跨域状态变化时：
+        - 同源 → 跨域：需要获取新的 session_id
+        - 跨域 → 同源：session_id 变为 None，需要 context_id
+        - 跨域 → 跨域(不同源)：需要获取新的 session_id
+        """
+        # 清空当前状态，等待事件更新
+        self._context_id = None
+        self._session_id = None
+
+        start = time.time()
+        while time.time() - start < timeout:
+            self._manager._cdp.poll_events(timeout=0.1)
+            self._manager._flush_pending_enables()
+            # 等待 context 被设置（无论是同源还是跨域，都会有 context 事件）
+            if self._context_id is not None:
+                return
+
+        raise Exception(f"Frame 状态刷新超时: {self._frame_id}")
 
     def _get_viewport_offset(self) -> tuple[float, float]:
         """获取当前 frame 相对于主视口的偏移量（用于 iframe 内的鼠标操作）"""
@@ -116,8 +126,6 @@ class Frame:
         - 根 frame / 跨域 iframe：不指定 contextId，让浏览器使用默认 context
         - 同源 iframe：需要指定 contextId 来区分和主页面
         """
-        self._ensure_not_detached()
-
         params = {
             "expression": expression,
             "returnByValue": return_by_value,
@@ -129,13 +137,16 @@ class Frame:
 
         try:
             result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
-        except Exception as e:
-            # Context 失效时自动恢复：重新等待新 context 并重试一次
-            err_msg = str(e)
-            if "Cannot find context" in err_msg or "context was destroyed" in err_msg:
-                self._context_id = None
-                self._ensure_context()
-                params["contextId"] = self._context_id
+        except CDPError as e:
+            # Context/Session 失效时自动恢复（iframe 导航可能导致跨域状态变化）
+            # -32000: Context 错误 (Cannot find context, Execution context was destroyed)
+            # -32001: Session 错误 (Session with given id not found, No target with given id)
+            if e.code in (-32000, -32001):
+                self._refresh_state()
+                # 重新构建 params（跨域状态可能已变化）
+                params = {"expression": expression, "returnByValue": return_by_value}
+                if self._needs_context_id():
+                    params["contextId"] = self._context_id
                 result = self.cdp.send("Runtime.evaluate", params, session_id=self._session_id)
             else:
                 raise
@@ -457,10 +468,6 @@ class Frame:
 
         return child_frame
 
-    def child_frames(self) -> list['Frame']:
-        """获取所有直接子 frame"""
-        return [f for f in self._manager._frames.values() if f._parent is self]
-
     # ==================== 截图 ====================
 
     def screenshot(self, path: Optional[str] = None) -> bytes:
@@ -530,16 +537,21 @@ class Frame:
     # ==================== 弹窗功能 ====================
 
     def handle_dialog(self, accept: bool = True, prompt_text: str = ""):
-        """处理弹窗（alert/confirm/prompt）"""
-        self._manager._handle_dialog(accept, prompt_text)
+        """处理弹窗（alert/confirm/prompt）
+
+        处理当前 frame 触发的弹窗。
+        """
+        self._manager._handle_dialog(self._frame_id, accept, prompt_text)
 
     def wait_for_dialog(self, timeout: float = 10) -> dict:
         """等待弹窗出现
 
+        等待当前 frame 触发的弹窗（与 CDP frameId 一致）。
+
         Returns:
-            弹窗信息，包含 type, message, defaultPrompt 等
+            弹窗信息，包含 type, message, frameId 等
         """
-        return self._manager._wait_for_dialog(timeout)
+        return self._manager._wait_for_dialog(self._frame_id, timeout)
 
 
 class FrameManager:
@@ -554,7 +566,7 @@ class FrameManager:
         self._pending_sessions: dict[str, dict] = {}  # session_id -> target_info
         self._sessions_to_enable: list[str] = []  # 待启用 Runtime 的 session
         self._pending_contexts: dict[str, tuple[int, Optional[str]]] = {}  # frame_id -> (context_id, session_id)
-        self._pending_dialog: Optional[dict] = None
+        self._pending_dialogs: dict[str, dict] = {}  # frame_id -> dialog params
         cdp.on_event(self._handle_event)
         cdp.send("Page.enable")
         cdp.send("Runtime.enable")
@@ -578,11 +590,7 @@ class FrameManager:
                       target_id: Optional[str] = None, owner_selector: Optional[str] = None) -> Frame:
         """获取或创建指向 frame 的代理对象"""
         if frame_id in self._frames:
-            existing = self._frames[frame_id]
-            if not existing._detached:
-                return existing
-            # 已 detached 的 frame，移除并重新创建
-            del self._frames[frame_id]
+            return self._frames[frame_id]
 
         frame = Frame(self, frame_id, parent=parent, target_id=target_id, owner_selector=owner_selector)
         self._frames[frame_id] = frame
@@ -614,7 +622,6 @@ class FrameManager:
             "Runtime.executionContextCreated": self._on_context_created,
             "Runtime.executionContextDestroyed": self._on_context_destroyed,
             "Target.attachedToTarget": self._on_target_attached,
-            "Page.frameDetached": self._on_frame_detached,
             "Page.javascriptDialogOpening": self._on_dialog_opening,
         }
         handler = handlers.get(method)
@@ -664,35 +671,45 @@ class FrameManager:
             # 延迟启用，避免在事件处理器中嵌套调用 send
             self._sessions_to_enable.append(new_session_id)
 
-    def _on_frame_detached(self, event: dict):
-        """处理 frame 移除"""
-        params = event.get("params", {})
-        frame_id = params.get("frameId")
-        if frame_id in self._frames:
-            self._frames[frame_id]._on_detached()
-
     def _on_dialog_opening(self, event: dict):
         """处理弹窗出现"""
         params = event.get("params", {})
-        self._pending_dialog = params
+        frame_id = params.get("frameId")
+        if frame_id:
+            self._pending_dialogs[frame_id] = params
 
     # ==================== 弹窗 ====================
 
-    def _handle_dialog(self, accept: bool = True, prompt_text: str = ""):
+    def _handle_dialog(self, frame_id: str, accept: bool = True, prompt_text: str = ""):
         """处理弹窗"""
         self._cdp.send("Page.handleJavaScriptDialog", {
             "accept": accept,
             "promptText": prompt_text
         })
+        # 清理已处理的弹窗
+        self._pending_dialogs.pop(frame_id, None)
 
-    def _wait_for_dialog(self, timeout: float = 10) -> dict:
-        """等待弹窗出现"""
+    def _wait_for_dialog(self, frame_id: Optional[str] = None, timeout: float = 10) -> dict:
+        """等待弹窗出现
+
+        Args:
+            frame_id: 可选，指定等待哪个 frame 的弹窗（与 CDP frameId 一致）
+            timeout: 超时时间（秒）
+
+        Returns:
+            弹窗信息，包含 type, message, frameId 等
+        """
         start = time.time()
         while time.time() - start < timeout:
             self._cdp.poll_events()
-            if self._pending_dialog:
-                result = self._pending_dialog
-                self._pending_dialog = None
-                return result
+            # 查找匹配的弹窗
+            if frame_id:
+                if frame_id in self._pending_dialogs:
+                    return self._pending_dialogs[frame_id]
+            else:
+                if self._pending_dialogs:
+                    # 返回第一个弹窗
+                    first_frame_id = next(iter(self._pending_dialogs.keys()))
+                    return self._pending_dialogs[first_frame_id]
             time.sleep(0.1)
         raise Exception("等待弹窗超时")

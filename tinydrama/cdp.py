@@ -13,6 +13,20 @@ from urllib.parse import urlparse
 from typing import Optional
 
 
+class CDPError(Exception):
+    """CDP 协议错误
+
+    常见错误码:
+    - -32000: Context 相关错误 (Cannot find context, Execution context was destroyed)
+    - -32001: Session/Target 相关错误 (Session with given id not found, No target with given id)
+    """
+
+    def __init__(self, code: int, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(f"CDP错误 [{code}]: {message}")
+
+
 class WebSocketClient:
     """简易 WebSocket 客户端实现"""
 
@@ -164,7 +178,8 @@ class CDPSession:
 
         response = self._responses.pop(msg_id)
         if "error" in response:
-            raise Exception(f"CDP错误: {response['error']}")
+            err = response["error"]
+            raise CDPError(err.get("code", 0), err.get("message", str(err)))
 
         return response.get("result", {})
 

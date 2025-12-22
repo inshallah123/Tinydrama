@@ -27,13 +27,14 @@ iframe 操作:
 
 from .browser import Browser
 from .frame import Frame, FrameManager
-from .cdp import CDPSession, WebSocketClient
+from .cdp import CDPSession, CDPError, WebSocketClient
 
 __all__ = [
     # 主要 API
     "Browser",
     "Frame",
-    # 兼容性
+    # 异常
+    "CDPError",
     # 高级用法
     "FrameManager",
     "CDPSession",
