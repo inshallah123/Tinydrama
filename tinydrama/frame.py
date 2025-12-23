@@ -359,6 +359,36 @@ class Frame:
         """
         self._evaluate(js)
 
+    def type(self, selector: str, text: str, clear: bool = True):
+        """模拟键盘输入（适用于 React/Vue 等框架的 controlled input）
+
+        Args:
+            selector: CSS 选择器
+            text: 要输入的文本
+            clear: 是否先清空现有内容（默认 True）
+        """
+        self.wait_for_selector(selector)
+        self.click(selector, native=True)
+
+        if clear:
+            # Ctrl+A 全选
+            self.cdp.send("Input.dispatchKeyEvent", {
+                "type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2
+            }, session_id=self._session_id)
+            self.cdp.send("Input.dispatchKeyEvent", {
+                "type": "keyUp", "key": "a", "code": "KeyA"
+            }, session_id=self._session_id)
+            # Backspace 删除
+            self.cdp.send("Input.dispatchKeyEvent", {
+                "type": "keyDown", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8
+            }, session_id=self._session_id)
+            self.cdp.send("Input.dispatchKeyEvent", {
+                "type": "keyUp", "key": "Backspace", "code": "Backspace"
+            }, session_id=self._session_id)
+
+        # insertText 输入（触发完整事件链，React/Vue 能正确响应）
+        self.cdp.send("Input.insertText", {"text": text}, session_id=self._session_id)
+
     def select(self, selector: str, *, value: Optional[str] = None, text: Optional[str] = None):
         """选择下拉框选项
 
