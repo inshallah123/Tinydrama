@@ -82,8 +82,9 @@ class Browser:
 
         # Chrome 136+ 要求 --user-data-dir 配合 --remote-debugging-port 使用
         # 参见: https://developer.chrome.com/blog/remote-debugging-port
-        # 配置目录放在当前工作目录下，便于用户管理和环境隔离
-        user_data_dir = os.path.join(os.getcwd(), ".tinydrama")
+        # 配置目录按浏览器类型分开存放，避免格式冲突
+        browser_name = "edge" if "edge" in browser_path.lower() else "chrome"
+        user_data_dir = os.path.join(os.getcwd(), ".tinydrama", browser_name)
         args = [
             browser_path,
             f"--remote-debugging-port={self.debug_port}",
