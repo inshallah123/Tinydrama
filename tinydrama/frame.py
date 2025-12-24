@@ -229,7 +229,7 @@ class Frame:
                 index: i,
                 tag: el.tagName.toLowerCase(),
                 id: el.id || null,
-                text: el.textContent?.trim().substring(0, 50) || '',
+                text: (el.textContent ? el.textContent.trim().substring(0, 50) : ''),
                 visible: style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null,
                 x: rect.x + rect.width / 2,
                 y: rect.y + rect.height / 2
@@ -282,9 +282,9 @@ class Frame:
     def click_by_text(self, text: str, tag: str = "*", exact: bool = False, timeout: float = 10):
         """通过文本内容点击元素"""
         if exact:
-            condition = f"el.textContent?.trim() === {json.dumps(text)}"
+            condition = f"el.textContent && el.textContent.trim() === {json.dumps(text)}"
         else:
-            condition = f"el.textContent?.includes({json.dumps(text)})"
+            condition = f"el.textContent && el.textContent.includes({json.dumps(text)})"
 
         js = f"""
         (function() {{
@@ -418,7 +418,7 @@ class Frame:
                 const sel = document.querySelector({json.dumps(selector)});
                 if (!sel) return false;
                 for (const opt of sel.options) {{
-                    if (opt.text?.includes({json.dumps(text)})) {{
+                    if (opt.text && opt.text.includes({json.dumps(text)})) {{
                         sel.value = opt.value;
                         sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
                         return true;
@@ -447,22 +447,22 @@ class Frame:
 
     def get_text(self, selector: str) -> str:
         """获取元素文本"""
-        js = f"document.querySelector({json.dumps(selector)})?.textContent || ''"
+        js = f"(function(){{var el=document.querySelector({json.dumps(selector)});return el?el.textContent:''}})()"
         return self._evaluate(js)
 
     def get_value(self, selector: str) -> str:
         """获取输入框的值"""
-        js = f"document.querySelector({json.dumps(selector)})?.value || ''"
+        js = f"(function(){{var el=document.querySelector({json.dumps(selector)});return el?el.value:''}})()"
         return self._evaluate(js)
 
     def get_attribute(self, selector: str, attr: str) -> str:
         """获取元素属性"""
-        js = f"document.querySelector({json.dumps(selector)})?.getAttribute({json.dumps(attr)})"
+        js = f"(function(){{var el=document.querySelector({json.dumps(selector)});return el?el.getAttribute({json.dumps(attr)}):null}})()"
         return self._evaluate(js)
 
     def is_checked(self, selector: str) -> bool:
         """检查复选框是否选中"""
-        js = f"document.querySelector({json.dumps(selector)})?.checked || false"
+        js = f"(function(){{var el=document.querySelector({json.dumps(selector)});return el?el.checked:false}})()"
         return self._evaluate(js)
 
     # ==================== iframe 操作 ====================

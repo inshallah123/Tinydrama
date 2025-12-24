@@ -84,9 +84,14 @@ class Browser:
                     break
                 time.sleep(0.1)
 
+        # Chrome 136+ 要求 --user-data-dir 配合 --remote-debugging-port 使用
+        # 参见: https://developer.chrome.com/blog/remote-debugging-port
+        # 配置目录放在当前工作目录下，便于用户管理和环境隔离
+        user_data_dir = os.path.join(os.getcwd(), ".tinydrama")
         args = [
             browser_path,
             f"--remote-debugging-port={self.debug_port}",
+            f"--user-data-dir={user_data_dir}",
             "--disable-restore-session-state",
         ]
         self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -147,10 +152,12 @@ class Browser:
 
     def _find_in_common_paths(self, exe_name: str) -> Optional[str]:
         """从常见安装路径查找浏览器"""
+        local_appdata = os.environ.get("LOCALAPPDATA", "")
         common_paths = {
             "chrome.exe": [
                 r"C:\Program Files\Google\Chrome\Application\chrome.exe",
                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.join(local_appdata, r"Google\Chrome\Application\chrome.exe"),
             ],
             "msedge.exe": [
                 r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
