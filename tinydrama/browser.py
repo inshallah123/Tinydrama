@@ -77,12 +77,8 @@ class Browser:
                     pass
                 self._browser_cdp = None
 
-            os.system(f"taskkill /f /im {process_name} 2>nul")
-            for _ in range(10):
-                result = subprocess.run("tasklist", capture_output=True, text=True, shell=True)
-                if process_name not in result.stdout:
-                    break
-                time.sleep(0.1)
+            # 只关闭占用调试端口的浏览器，不影响用户正常使用的浏览器
+            self._close_debug_port_browser()
 
         # Chrome 136+ 要求 --user-data-dir 配合 --remote-debugging-port 使用
         # 参见: https://developer.chrome.com/blog/remote-debugging-port
@@ -169,33 +165,38 @@ class Browser:
                 return path
         return None
 
+    def _close_debug_port_browser(self):
+        """关闭占用调试端口的浏览器（不影响用户正常使用的浏览器）"""
+        try:
+            ws_url = self._cdp_http("/json/version")["webSocketDebuggerUrl"]
+            cdp = CDPSession(ws_url, timeout=5)
+            try:
+                cdp.send("Browser.close")
+            except Exception:
+                pass
+            cdp.close()
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    def _cdp_http(self, path: str):
+        """CDP HTTP 接口请求"""
+        conn = http.client.HTTPConnection("127.0.0.1", self.debug_port)
+        conn.request("GET", path)
+        response = conn.getresponse()
+        data = json.loads(response.read().decode())
+        conn.close()
+        return data
+
     def connect(self) -> Frame:
         """连接到已运行的浏览器，返回主 Frame"""
         return self._connect_first_tab()
-
-    def _get_targets(self) -> list:
-        """获取所有调试目标"""
-        conn = http.client.HTTPConnection("127.0.0.1", self.debug_port)
-        conn.request("GET", "/json")
-        response = conn.getresponse()
-        targets = json.loads(response.read().decode())
-        conn.close()
-        return targets
-
-    def _get_browser_ws_url(self) -> str:
-        """获取 browser-level WebSocket URL"""
-        conn = http.client.HTTPConnection("127.0.0.1", self.debug_port)
-        conn.request("GET", "/json/version")
-        response = conn.getresponse()
-        info = json.loads(response.read().decode())
-        conn.close()
-        return info["webSocketDebuggerUrl"]
 
     def _connect_browser_cdp(self):
         """建立 browser-level CDP 连接"""
         if self._browser_cdp:
             return
-        ws_url = self._get_browser_ws_url()
+        ws_url = self._cdp_http("/json/version")["webSocketDebuggerUrl"]
         self._browser_cdp = CDPSession(ws_url, self.timeout)
         self._browser_cdp.on_event(self._handle_browser_event)
 
@@ -217,7 +218,7 @@ class Browser:
 
     def _connect_first_tab(self) -> Frame:
         """连接到第一个可用的标签页"""
-        targets = self._get_targets()
+        targets = self._cdp_http("/json")
 
         page_target = None
         for target in targets:
@@ -254,7 +255,7 @@ class Browser:
 
         time.sleep(0.1)
 
-        targets = self._get_targets()
+        targets = self._cdp_http("/json")
         for target in targets:
             if target.get("id") == target_id:
                 return self._create_frame(target)

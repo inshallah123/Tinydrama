@@ -252,6 +252,16 @@ class Frame:
             raise Exception(f"无法获取元素 objectId: {selector}")
         self.cdp.send("DOM.scrollIntoViewIfNeeded", {"objectId": object_id}, session_id=self._session_id)
 
+    def _dispatch_mouse(self, selector: str, click_count: int = 1):
+        """分发原生鼠标事件"""
+        self._scroll_into_view(selector)
+        elem = self.query_selector(selector)
+        assert elem is not None
+        offset_x, offset_y = self._get_viewport_offset()
+        x, y = elem["x"] + offset_x, elem["y"] + offset_y
+        self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": click_count})
+        self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": click_count})
+
     def click(self, selector: str, native: bool = False):
         """点击元素
 
@@ -261,13 +271,7 @@ class Frame:
         """
         self.wait_for_selector(selector)
         if native:
-            self._scroll_into_view(selector)
-            elem = self.query_selector(selector)
-            assert elem is not None
-            offset_x, offset_y = self._get_viewport_offset()
-            x, y = elem["x"] + offset_x, elem["y"] + offset_y
-            self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1})
-            self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1})
+            self._dispatch_mouse(selector, 1)
         else:
             clicked = self._evaluate(f"""
             (function() {{
@@ -320,13 +324,7 @@ class Frame:
         """
         self.wait_for_selector(selector)
         if native:
-            self._scroll_into_view(selector)
-            elem = self.query_selector(selector)
-            assert elem is not None
-            offset_x, offset_y = self._get_viewport_offset()
-            x, y = elem["x"] + offset_x, elem["y"] + offset_y
-            self.cdp.send("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 2})
-            self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 2})
+            self._dispatch_mouse(selector, 2)
         else:
             self._evaluate(f"""
             (function() {{
