@@ -20,3 +20,11 @@ env/
 .claude/
 auto_download.py
 test.py
+
+# Build/Install
+*.egg-info/
+dist/
+build/
+
+# Chrome 配置目录
+.tinydrama/
