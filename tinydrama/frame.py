@@ -283,8 +283,17 @@ class Frame:
             if not clicked:
                 raise Exception(f"点击失败: {selector}")
 
-    def click_by_text(self, text: str, tag: str = "*", exact: bool = False, timeout: float = 10):
-        """通过文本内容点击元素"""
+    def click_by_text(self, text: str, tag: str = "*", exact: bool = False,
+                      timeout: float = 10, native: bool = False):
+        """通过文本内容点击元素
+
+        Args:
+            text: 要匹配的文本
+            tag: HTML 标签过滤（默认 * 匹配所有）
+            exact: 是否精确匹配（默认 False 为包含匹配）
+            timeout: 超时时间（秒）
+            native: 是否使用原生鼠标事件
+        """
         if exact:
             condition = f"el.textContent && el.textContent.trim() === {json.dumps(text)}"
         else:
@@ -308,7 +317,8 @@ class Frame:
         while time.time() - start < timeout:
             count = self._evaluate(js)
             if count == 1:
-                self.click("[data-td-tmp='1']")
+                self.click("[data-td-tmp='1']", native=native)
+                self._evaluate("document.querySelector('[data-td-tmp]')?.removeAttribute('data-td-tmp')")
                 return
             elif count > 1:
                 raise Exception(f"文本 '{text}' 匹配到 {count} 个元素，请使用更精确的选择器")
@@ -343,49 +353,42 @@ class Frame:
         x, y = elem["x"] + offset_x, elem["y"] + offset_y
         self.cdp.send("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
 
-    def fill(self, selector: str, value: str):
-        """填充表单值"""
-        self.wait_for_selector(selector)
-        js = f"""
-        (function(selector, value) {{
-            const el = document.querySelector(selector);
-            el.focus();
-            el.value = value;
-            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        }})({json.dumps(selector)}, {json.dumps(value)})
-        """
-        self._evaluate(js)
-
-    def type(self, selector: str, text: str, clear: bool = True):
-        """模拟键盘输入（适用于 React/Vue 等框架的 controlled input）
+    def fill(self, selector: str, value: str, native: bool = False):
+        """填充表单值
 
         Args:
             selector: CSS 选择器
-            text: 要输入的文本
-            clear: 是否先清空现有内容（默认 True）
+            value: 要填充的值
+            native: 是否使用原生键盘输入（默认 False，React/Vue 等框架设为 True）
         """
         self.wait_for_selector(selector)
-        self.click(selector, native=True)
-
-        if clear:
-            # Ctrl+A 全选
+        if native:
+            self.click(selector, native=True)
+            # Ctrl+A 全选 + Backspace 清空
             self.cdp.send("Input.dispatchKeyEvent", {
                 "type": "keyDown", "key": "a", "code": "KeyA", "modifiers": 2
             }, session_id=self._session_id)
             self.cdp.send("Input.dispatchKeyEvent", {
                 "type": "keyUp", "key": "a", "code": "KeyA"
             }, session_id=self._session_id)
-            # Backspace 删除
             self.cdp.send("Input.dispatchKeyEvent", {
                 "type": "keyDown", "key": "Backspace", "code": "Backspace", "windowsVirtualKeyCode": 8
             }, session_id=self._session_id)
             self.cdp.send("Input.dispatchKeyEvent", {
                 "type": "keyUp", "key": "Backspace", "code": "Backspace"
             }, session_id=self._session_id)
-
-        # insertText 输入（触发完整事件链，React/Vue 能正确响应）
-        self.cdp.send("Input.insertText", {"text": text}, session_id=self._session_id)
+            self.cdp.send("Input.insertText", {"text": value}, session_id=self._session_id)
+        else:
+            js = f"""
+            (function(selector, value) {{
+                const el = document.querySelector(selector);
+                el.focus();
+                el.value = value;
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }})({json.dumps(selector)}, {json.dumps(value)})
+            """
+            self._evaluate(js)
 
     def select(self, selector: str, *, value: Optional[str] = None, text: Optional[str] = None):
         """选择下拉框选项
